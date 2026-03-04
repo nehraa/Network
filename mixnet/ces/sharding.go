@@ -3,6 +3,7 @@ package ces
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -80,7 +81,11 @@ func (s *Sharder) Shard(data []byte) ([]*Shard, error) {
 	for i := 0; i < s.totalShards; i++ {
 		cp := make([]byte, len(shards[i]))
 		copy(cp, shards[i])
-		result[i] = &Shard{Index: i, Data: cp}
+		checksum := crc32.ChecksumIEEE(cp)
+		withCRC := make([]byte, len(cp)+4)
+		copy(withCRC, cp)
+		binary.LittleEndian.PutUint32(withCRC[len(cp):], checksum)
+		result[i] = &Shard{Index: i, Data: withCRC}
 	}
 	return result, nil
 }
@@ -95,7 +100,15 @@ func (s *Sharder) Reconstruct(shards []*Shard) ([]byte, error) {
 	shardData := make([][]byte, s.totalShards)
 	for _, sh := range shards {
 		if sh.Index >= 0 && sh.Index < s.totalShards {
-			shardData[sh.Index] = sh.Data
+			if len(sh.Data) >= 4 {
+				body := sh.Data[:len(sh.Data)-4]
+				expectedCRC := binary.LittleEndian.Uint32(sh.Data[len(sh.Data)-4:])
+				if crc32.ChecksumIEEE(body) == expectedCRC {
+					shardData[sh.Index] = body
+				}
+				// else: corrupted, treat as missing (nil)
+			}
+			// else: too short, treat as missing
 		}
 	}
 

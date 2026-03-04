@@ -2,8 +2,10 @@ package mixnet
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -30,6 +32,14 @@ type Mixnet struct {
 	relayHandler *relay.Handler
 	discovery    *discovery.RelayDiscovery
 	metrics      *MetricsCollector
+	privacyMgr   *PrivacyManager
+	keyManager   *KeyManager
+
+	// Unique session counter (atomic)
+	sessionCounter uint64
+
+	// Closing flag
+	closing atomic.Bool
 
 	// For origin mode
 	originCtx    context.Context
@@ -44,11 +54,17 @@ type Mixnet struct {
 	mu sync.RWMutex
 }
 
+// sessionBuffer groups shards and keys for a single send session (Issue 9).
+type sessionBuffer struct {
+	shards    []*ces.Shard
+	keys      []*ces.EncryptionKey
+	startedAt time.Time
+}
+
 // DestinationHandler handles incoming data at the destination
 type DestinationHandler struct {
 	pipeline  *ces.CESPipeline
-	shardBuf  map[string][]*ces.Shard
-	keys      map[string][]*ces.EncryptionKey
+	sessions  map[string]*sessionBuffer
 	threshold int
 	timeout   time.Duration
 	dataCh    chan []byte
@@ -106,12 +122,13 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 		relayHandler: relayHandler,
 		discovery:    relayDiscovery,
 		metrics:      metrics,
+		privacyMgr:   NewPrivacyManager(DefaultPrivacyConfig()),
+		keyManager:   NewKeyManager(),
 		originCtx:    originCtx,
 		originCancel: originCancel,
 		destHandler: &DestinationHandler{
 			pipeline:  pipeline,
-			shardBuf:  make(map[string][]*ces.Shard),
-			keys:      make(map[string][]*ces.EncryptionKey),
+			sessions:  make(map[string]*sessionBuffer),
 			threshold: cfg.GetErasureThreshold(),
 			timeout:   30 * time.Second,
 			dataCh:    make(chan []byte, 10),
@@ -143,19 +160,22 @@ func (h *DestinationHandler) waitForData() {
 			return
 		case <-ticker.C:
 			h.mu.Lock()
-			for sessionID, shards := range h.shardBuf {
-				if len(shards) >= h.threshold {
-					keys := h.keys[sessionID]
-					data, err := h.pipeline.Reconstruct(shards, keys)
+			for sessionID, sess := range h.sessions {
+				// Expire sessions older than 30 seconds (Issue 9)
+				if time.Since(sess.startedAt) > 30*time.Second {
+					ces.EraseKeys(sess.keys)
+					delete(h.sessions, sessionID)
+					continue
+				}
+				if len(sess.shards) >= h.threshold {
+					data, err := h.pipeline.Reconstruct(sess.shards, sess.keys)
 					if err == nil {
 						select {
 						case h.dataCh <- data:
 						default:
 						}
-						// Erase keys after successful reconstruction (Req 16.3).
-						ces.EraseKeys(keys)
-						delete(h.shardBuf, sessionID)
-						delete(h.keys, sessionID)
+						ces.EraseKeys(sess.keys)
+						delete(h.sessions, sessionID)
 					}
 				}
 			}
@@ -220,7 +240,19 @@ func (m *Mixnet) discoverRelays(ctx context.Context, dest peer.ID) ([]circuit.Re
 	var providers []peer.AddrInfo
 	for p := range provCh {
 		if p.ID != m.host.ID() && p.ID != dest {
-			providers = append(providers, p)
+			// Check if peer supports mixnet protocol via peerstore (Issue 5)
+			protos, err := m.host.Peerstore().GetProtocols(p.ID)
+			if err == nil {
+				for _, proto := range protos {
+					if string(proto) == ProtocolID {
+						providers = append(providers, p)
+						break
+					}
+				}
+			} else {
+				// If we can't check (peer not in peerstore yet), include anyway
+				providers = append(providers, p)
+			}
 		}
 	}
 
@@ -231,15 +263,7 @@ func (m *Mixnet) discoverRelays(ctx context.Context, dest peer.ID) ([]circuit.Re
 	// Select relays based on mode (Req 4, 5)
 	selected, err := m.discovery.FindRelays(ctx, providers, m.config.HopCount, m.config.CircuitCount)
 	if err != nil {
-		// Fallback to all discovered
-		relays := make([]circuit.RelayInfo, len(providers))
-		for i, p := range providers {
-			relays[i] = circuit.RelayInfo{
-				PeerID:   p.ID,
-				AddrInfo: p,
-			}
-		}
-		return relays, nil
+		return nil, fmt.Errorf("relay selection failed: %w", err)
 	}
 
 	// Convert discovery.RelayInfo to circuit.RelayInfo
@@ -262,6 +286,10 @@ func (m *Mixnet) getSampleRelays(ctx context.Context, dest peer.ID) ([]circuit.R
 
 // Send sends data through the mixnet to the destination (Req 8)
 func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
+	if m.closing.Load() {
+		return fmt.Errorf("mixnet is closing")
+	}
+
 	circuits := m.circuitMgr.ListCircuits()
 	if len(circuits) == 0 {
 		return fmt.Errorf("no circuits established")
@@ -289,8 +317,12 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 	// Record compression ratio
 	m.metrics.RecordCompressionRatio(originalSize, len(data))
 
+	// Generate unique session ID (Issue 8)
+	sessionID := atomic.AddUint64(&m.sessionCounter, 1)
+	sessionIDStr := fmt.Sprintf("session-%d", sessionID)
+
 	// Store keys for destination to decrypt
-	m.destHandler.SetKeys("default", keys)
+	m.destHandler.SetKeys(sessionIDStr, keys)
 
 	// Only send as many shards as we have circuits; excess shards are dropped
 	// with an explicit log so silent data loss is avoided (Req 2.4).
@@ -308,15 +340,13 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 		shard := shards[i]
 
 		wg.Add(1)
-		go func(shardData []byte, circuitID string, idx int) {
+		go func(shardData []byte, circuitID string, idx int, sid uint64) {
 			defer wg.Done()
 
-			// Write shard with 4-byte index header
-			header := make([]byte, 4)
-			header[0] = byte(idx)
-			header[1] = byte(idx >> 8)
-			header[2] = byte(idx >> 16)
-			header[3] = byte(idx >> 24)
+			// Write shard with 12-byte header: 4-byte index + 8-byte session ID (Issue 8)
+			header := make([]byte, 12)
+			binary.LittleEndian.PutUint32(header[0:4], uint32(idx))
+			binary.LittleEndian.PutUint64(header[4:12], sid)
 
 			fullData := append(header, shardData...)
 
@@ -330,7 +360,8 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 				return
 			}
 			m.metrics.RecordThroughput(uint64(len(fullData)))
-		}(shard.Data, circuitID, i)
+			m.metrics.RecordCircuitThroughput(circuitID, uint64(len(fullData)))
+		}(shard.Data, circuitID, i, sessionID)
 	}
 
 	wg.Wait()
@@ -365,17 +396,17 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 
 	shardData := buf[:n]
 
-	// Parse shard header to get index
-	shard, err := m.parseShard(shardData)
+	// Parse shard header to get index and session ID (Issue 8)
+	shard, sessionID, err := m.parseShard(shardData)
 	if err != nil {
 		return
 	}
 
-	// Add to buffer with session based on connection
-	m.destHandler.AddShard("default", shard)
+	// Add to buffer keyed by session ID
+	m.destHandler.AddShard(sessionID, shard)
 
 	// Check if we can reconstruct
-	data, err := m.destHandler.TryReconstruct("default")
+	data, err := m.destHandler.TryReconstruct(sessionID)
 	if err != nil {
 		return
 	}
@@ -384,45 +415,50 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	_ = data
 }
 
-// parseShard parses shard data from the stream
-func (m *Mixnet) parseShard(data []byte) (*ces.Shard, error) {
-	if len(data) < 4 {
-		return &ces.Shard{Index: 0, Data: data}, nil
+// parseShard parses shard data including 12-byte header (Issue 8).
+func (m *Mixnet) parseShard(data []byte) (*ces.Shard, string, error) {
+	if len(data) < 12 {
+		return &ces.Shard{Index: 0, Data: data}, "session-0", nil
 	}
 
-	index := int(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24)
+	index := int(binary.LittleEndian.Uint32(data[0:4]))
+	sessionID := binary.LittleEndian.Uint64(data[4:12])
+	sessionIDStr := fmt.Sprintf("session-%d", sessionID)
 	return &ces.Shard{
 		Index: index,
-		Data:  data[4:],
-	}, nil
+		Data:  data[12:],
+	}, sessionIDStr, nil
 }
 
-// AddShard adds a shard to the destination buffer
+// AddShard adds a shard to the destination buffer (Issue 9)
 func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.shardBuf[sessionID] = append(h.shardBuf[sessionID], shard)
+	if _, ok := h.sessions[sessionID]; !ok {
+		h.sessions[sessionID] = &sessionBuffer{startedAt: time.Now()}
+	}
+	h.sessions[sessionID].shards = append(h.sessions[sessionID].shards, shard)
 }
 
 // TryReconstruct attempts to reconstruct data (Req 9)
 func (h *DestinationHandler) TryReconstruct(sessionID string) ([]byte, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	shards := h.shardBuf[sessionID]
-	if len(shards) < h.threshold {
-		return nil, fmt.Errorf("insufficient shards: have %d, need %d", len(shards), h.threshold)
+	sess, ok := h.sessions[sessionID]
+	if !ok || len(sess.shards) < h.threshold {
+		return nil, fmt.Errorf("insufficient shards")
 	}
-
-	keys := h.keys[sessionID]
-	return h.pipeline.Reconstruct(shards, keys)
+	return h.pipeline.Reconstruct(sess.shards, sess.keys)
 }
 
-// SetKeys sets the decryption keys for a session
+// SetKeys sets the decryption keys for a session (Issue 9)
 func (h *DestinationHandler) SetKeys(sessionID string, keys []*ces.EncryptionKey) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.keys[sessionID] = keys
+	if _, ok := h.sessions[sessionID]; !ok {
+		h.sessions[sessionID] = &sessionBuffer{startedAt: time.Now()}
+	}
+	h.sessions[sessionID].keys = keys
 }
 
 // DataChan returns the channel for reconstructed data
@@ -432,6 +468,8 @@ func (h *DestinationHandler) DataChan() <-chan []byte {
 
 // Close closes the mixnet (Req 18)
 func (m *Mixnet) Close() error {
+	m.closing.Store(true)
+
 	if m.originCancel != nil {
 		m.originCancel()
 	}
@@ -444,10 +482,10 @@ func (m *Mixnet) Close() error {
 	// Erase all buffered session keys (Req 16.3, 18.4).
 	if m.destHandler != nil {
 		m.destHandler.mu.Lock()
-		for sessionID, keys := range m.destHandler.keys {
-			ces.EraseKeys(keys)
-			delete(m.destHandler.keys, sessionID)
+		for _, sess := range m.destHandler.sessions {
+			ces.EraseKeys(sess.keys)
 		}
+		m.destHandler.sessions = make(map[string]*sessionBuffer)
 		m.destHandler.mu.Unlock()
 	}
 
@@ -494,6 +532,11 @@ func (m *Mixnet) Host() host.Host {
 // Metrics returns the metrics collector
 func (m *Mixnet) Metrics() *MetricsCollector {
 	return m.metrics
+}
+
+// PrivacyManager returns the privacy manager (Issue 7).
+func (m *Mixnet) PrivacyManager() *PrivacyManager {
+	return m.privacyMgr
 }
 
 // ActiveConnections returns the active connections
@@ -592,10 +635,21 @@ func (m *Mixnet) RecoverFromFailure(ctx context.Context, dest peer.ID) error {
 
 	m.metrics.RecordRecovery()
 
-	// Discover fresh relays so we don't rebuild with stale/failed ones (Req 10.3).
-	newRelays, err := m.discoverRelays(ctx, dest)
-	if err != nil {
-		return fmt.Errorf("failed to discover relays for recovery: %w", err)
+	// Discover fresh relays with retry loop (Issue 11)
+	var newRelays []circuit.RelayInfo
+	var discoverErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		newRelays, discoverErr = m.discoverRelays(ctx, dest)
+		if discoverErr == nil {
+			break
+		}
+		if !IsRetryable(discoverErr) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	if discoverErr != nil {
+		return fmt.Errorf("failed to discover relays for recovery after retries: %w", discoverErr)
 	}
 
 	// Update the circuit manager relay pool with freshly discovered relays.

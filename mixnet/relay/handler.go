@@ -8,6 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/flynn/noise"
+	cryptorand "crypto/rand"
+
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -41,17 +44,23 @@ type Handler struct {
 	maxCircuits  int
 	activeRelays map[string]*RelayInfo // circuitID -> relay info
 	protocolID   string
+	noiseKeypair noise.DHKey
 	mu           sync.RWMutex
 }
 
 // NewHandler creates a new relay handler
 func NewHandler(host host.Host, maxCircuits int, maxBandwidth int64) *Handler {
+	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate noise keypair for relay handler: %v", err))
+	}
 	return &Handler{
 		host:         host,
 		maxBandwidth: maxBandwidth,
 		maxCircuits:  maxCircuits,
 		activeRelays: make(map[string]*RelayInfo),
 		protocolID:   ProtocolID,
+		noiseKeypair: kp,
 	}
 }
 
@@ -84,6 +93,53 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 
 	// Set a read deadline so the relay cannot be held open indefinitely (Req 6.3).
 	stream.SetDeadline(time.Now().Add(ReadTimeout))
+
+	// Perform Noise XX handshake as responder (Issue 14)
+	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	responderCfg := noise.Config{
+		CipherSuite:   cs,
+		Random:        cryptorand.Reader,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     false,
+		StaticKeypair: h.noiseKeypair,
+	}
+	hs, err := noise.NewHandshakeState(responderCfg)
+	if err != nil {
+		return fmt.Errorf("noise handshake setup: %w", err)
+	}
+	// <- e (read msg1: 4-byte length prefix + payload)
+	var msg1LenBuf [4]byte
+	if _, err := io.ReadFull(stream, msg1LenBuf[:]); err != nil {
+		return fmt.Errorf("noise read msg1 len: %w", err)
+	}
+	msg1Len := int(binary.LittleEndian.Uint32(msg1LenBuf[:]))
+	if msg1Len <= 0 || msg1Len > 4096 {
+		return fmt.Errorf("invalid noise msg1 length: %d", msg1Len)
+	}
+	msg1 := make([]byte, msg1Len)
+	if _, err := io.ReadFull(stream, msg1); err != nil {
+		return fmt.Errorf("noise read msg1: %w", err)
+	}
+	if _, _, _, err = hs.ReadMessage(nil, msg1); err != nil {
+		return fmt.Errorf("noise parse msg1: %w", err)
+	}
+	// -> e, ee, s, es (write msg2)
+	msg2, _, _, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		return fmt.Errorf("noise write msg2: %w", err)
+	}
+	if _, err := stream.Write(msg2); err != nil {
+		return fmt.Errorf("noise send msg2: %w", err)
+	}
+	// <- s, se (read msg3)
+	msg3Buf := make([]byte, 4096)
+	n3, err := stream.Read(msg3Buf)
+	if err != nil {
+		return fmt.Errorf("noise read msg3: %w", err)
+	}
+	if _, _, _, err = hs.ReadMessage(nil, msg3Buf[:n3]); err != nil {
+		return fmt.Errorf("noise parse msg3: %w", err)
+	}
 
 	// Read destination length (2 bytes, little-endian).
 	destLenBuf := make([]byte, 2)

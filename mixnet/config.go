@@ -23,6 +23,7 @@ type MixnetConfig struct {
 	HopCount         int
 	CircuitCount     int
 	Compression      string
+	CompressionLevel int
 	ErasureThreshold int
 
 	// Relay selection (Req 4)
@@ -36,6 +37,7 @@ func DefaultConfig() *MixnetConfig {
 		HopCount:         2,
 		CircuitCount:     3,
 		Compression:      "gzip",
+		CompressionLevel: 0,
 		ErasureThreshold: 0, // 0 means default to CircuitCount - 1
 
 		// Relay selection defaults
@@ -72,6 +74,11 @@ func (c *MixnetConfig) Validate() error {
 	// Compression algorithm validation (Req 3.2)
 	if c.Compression != "gzip" && c.Compression != "snappy" {
 		return fmt.Errorf("compression must be gzip or snappy, got %s", c.Compression)
+	}
+
+	// Compression level validation (Issue 2)
+	if c.Compression == "gzip" && c.CompressionLevel != 0 && (c.CompressionLevel < 1 || c.CompressionLevel > 9) {
+		return fmt.Errorf("compression level must be 1-9 for gzip (or 0 for default), got %d", c.CompressionLevel)
 	}
 
 	// Erasure threshold validation (Req 15.3)
@@ -138,6 +145,10 @@ func (c *MixnetConfig) SetSamplingSize(n int) {
 
 func (c *MixnetConfig) SetRandomnessFactor(f float64) {
 	c.RandomnessFactor = f
+}
+
+func (c *MixnetConfig) SetCompressionLevel(level int) {
+	c.CompressionLevel = level
 }
 
 // GetErasureThreshold returns the effective threshold.

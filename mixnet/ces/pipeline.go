@@ -6,9 +6,10 @@ import (
 
 // Config holds CES pipeline configuration
 type Config struct {
-	HopCount        int
-	CircuitCount    int
-	Compression     string
+	HopCount         int
+	CircuitCount     int
+	Compression      string
+	CompressionLevel int
 	ErasureThreshold int
 }
 
@@ -33,7 +34,7 @@ func NewPipeline(cfg *Config) *CESPipeline {
 
 	return &CESPipeline{
 		cfg:        cfg,
-		compressor: NewCompressor(cfg.Compression),
+		compressor: NewCompressorWithLevel(cfg.Compression, cfg.CompressionLevel),
 		sharder:    NewSharder(cfg.CircuitCount, threshold),
 		encrypter:  NewLayeredEncrypter(cfg.HopCount),
 	}

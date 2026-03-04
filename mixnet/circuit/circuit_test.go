@@ -231,7 +231,7 @@ func TestCircuitManager_CanRecover(t *testing.T) {
 func TestCircuitManager_RecoveryCapacity(t *testing.T) {
 	cfg := &CircuitConfig{
 		HopCount:     1,
-		CircuitCount: 5, // threshold = 4
+		CircuitCount: 5, // threshold = ceil(5*0.6) = 3
 	}
 	mgr := NewCircuitManager(cfg)
 
@@ -245,15 +245,15 @@ func TestCircuitManager_RecoveryCapacity(t *testing.T) {
 	}
 
 	capacity := mgr.RecoveryCapacity()
-	if capacity != 1 {
-		t.Errorf("expected recovery capacity 1, got %d", capacity)
+	if capacity != 2 {
+		t.Errorf("expected recovery capacity 2, got %d", capacity)
 	}
 
 	// Fail one
 	mgr.MarkCircuitFailed(circuits[0].ID)
 	capacity = mgr.RecoveryCapacity()
-	if capacity != 0 {
-		t.Errorf("expected recovery capacity 0, got %d", capacity)
+	if capacity != 1 {
+		t.Errorf("expected recovery capacity 1, got %d", capacity)
 	}
 }
 

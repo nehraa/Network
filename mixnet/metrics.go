@@ -16,11 +16,16 @@ type MetricsCollector struct {
 	throughputBytes  uint64
 	compressionRatio float64
 	activeCircuits   int
+
+	circuitThroughput map[string]uint64
+	circuitMu         sync.RWMutex
 }
 
 // NewMetricsCollector creates a new metrics collector
 func NewMetricsCollector() *MetricsCollector {
-	return &MetricsCollector{}
+	return &MetricsCollector{
+		circuitThroughput: make(map[string]uint64),
+	}
 }
 
 // RecordRTT records an RTT measurement (Req 5)
@@ -159,4 +164,22 @@ func (m *MetricsCollector) ActiveCircuits() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.activeCircuits
+}
+
+// RecordCircuitThroughput records bytes sent on a specific circuit (Issue 10).
+func (m *MetricsCollector) RecordCircuitThroughput(circuitID string, bytes uint64) {
+	m.circuitMu.Lock()
+	defer m.circuitMu.Unlock()
+	m.circuitThroughput[circuitID] += bytes
+}
+
+// GetCircuitThroughput returns a copy of per-circuit throughput counters.
+func (m *MetricsCollector) GetCircuitThroughput() map[string]uint64 {
+	m.circuitMu.RLock()
+	defer m.circuitMu.RUnlock()
+	result := make(map[string]uint64, len(m.circuitThroughput))
+	for k, v := range m.circuitThroughput {
+		result[k] = v
+	}
+	return result
 }

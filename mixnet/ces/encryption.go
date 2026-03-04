@@ -1,35 +1,49 @@
 package ces
 
 import (
-	"crypto/rand"
+	cryptorand "crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 
-	"golang.org/x/crypto/chacha20poly1305"
+	"github.com/flynn/noise"
 )
 
-// LayeredEncrypter handles layered onion encryption
+// noiseSuite is the cipher suite used for all layered encryption.
+var noiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+
+// LayeredEncrypter handles layered onion encryption using Noise Protocol primitives
 type LayeredEncrypter struct {
 	hopCount int
 }
 
-// EncryptionKey represents an ephemeral key for one encryption layer
+// EncryptionKey represents key material for one encryption layer
 type EncryptionKey struct {
-	Key        []byte
-	Destination string
+	Key          []byte
+	EphemeralPub []byte
+	Destination  string
 }
 
-// NewLayeredEncrypter creates a new layered encrypter
 func NewLayeredEncrypter(hopCount int) *LayeredEncrypter {
-	return &LayeredEncrypter{
-		hopCount: hopCount,
-	}
+	return &LayeredEncrypter{hopCount: hopCount}
 }
 
-// Encrypt encrypts data with layered encryption (onion routing)
-// Each layer wraps the data with destination info and encryption
-// Destinations should be ordered from entry to exit (first hop = entry)
+// deriveKey uses HMAC-SHA256 HKDF to derive a 32-byte key from inputKeyMaterial.
+func deriveKey(inputKeyMaterial []byte) ([]byte, error) {
+	// HKDF-Extract with zero chaining key
+	ck := make([]byte, 32)
+	mac1 := hmac.New(sha256.New, ck)
+	mac1.Write(inputKeyMaterial)
+	prk := mac1.Sum(nil)
+	// HKDF-Expand: T(1) = HMAC(prk, 0x01)
+	mac2 := hmac.New(sha256.New, prk)
+	mac2.Write([]byte{0x01})
+	return mac2.Sum(nil)[:32], nil
+}
+
+// Encrypt encrypts data with Noise-framework-based layered (onion) encryption.
 func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]byte, []*EncryptionKey, error) {
 	if len(destinations) != e.hopCount {
 		return nil, nil, fmt.Errorf("expected %d destinations, got %d", e.hopCount, len(destinations))
@@ -37,117 +51,97 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 
 	keys := make([]*EncryptionKey, e.hopCount)
 
-	// Generate ephemeral keys for each layer
 	for i := 0; i < e.hopCount; i++ {
-		key := make([]byte, 32) // chacha20poly1305 key size
-		if _, err := io.ReadFull(rand.Reader, key); err != nil {
-			return nil, nil, err
+		kp, err := noiseSuite.GenerateKeypair(cryptorand.Reader)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to generate keypair for hop %d: %w", i, err)
+		}
+		k, err := deriveKey(kp.Private)
+		// Securely erase the ephemeral private key after derivation (Req 16.3)
+		SecureEraseBytes(kp.Private)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to derive key for hop %d: %w", i, err)
 		}
 		keys[i] = &EncryptionKey{
-			Key:         key,
-			Destination: destinations[i],
+			Key:          k,
+			EphemeralPub: kp.Public,
+			Destination:  destinations[i],
 		}
 	}
 
-	// Build encrypted payload from outside in (reverse order for onion)
-	// Start with innermost layer (exit relay)
 	currentData := plaintext
-
 	for i := e.hopCount - 1; i >= 0; i-- {
-		// Create header: [dest_len(2)][dest_len_varint][dest_bytes][data]
-		header := make([]byte, 2+binary.MaxVarintLen64+len(keys[i].Destination))
-		binary.LittleEndian.PutUint16(header[0:2], uint16(len(keys[i].Destination)))
-		offset := 2
-		// Write destination length as varint (for future use)
-		varintBuf := make([]byte, binary.MaxVarintLen64)
-		n := binary.PutUvarint(varintBuf, uint64(len(keys[i].Destination)))
-		offset += n
-		copy(header[offset:], keys[i].Destination)
-		offset += len(keys[i].Destination)
+		dest := destinations[i]
+		// Header: [dest_len: 2 bytes][dest_bytes][ephemeral_pub: 32 bytes]
+		header := make([]byte, 2+len(dest)+32)
+		binary.LittleEndian.PutUint16(header[0:2], uint16(len(dest)))
+		copy(header[2:], dest)
+		copy(header[2+len(dest):], keys[i].EphemeralPub)
 
-		// Prepend header to data
-		payload := append(header[:offset], currentData...)
+		payload := append(header, currentData...)
 
-		// Encrypt with ChaCha20-Poly1305
-		aead, err := chacha20poly1305.NewX(keys[i].Key)
-		if err != nil {
-			return nil, nil, err
+		// Encrypt with Noise CipherChaChaPoly
+		var nonceArr [8]byte
+		if _, err := io.ReadFull(cryptorand.Reader, nonceArr[:]); err != nil {
+			return nil, nil, fmt.Errorf("failed to generate nonce for hop %d: %w", i, err)
 		}
+		nonce := binary.LittleEndian.Uint64(nonceArr[:])
+		var cipherKey [32]byte
+		copy(cipherKey[:], keys[i].Key)
+		cipher := noiseSuite.Cipher(cipherKey)
 
-		nonce := make([]byte, aead.NonceSize(), aead.NonceSize()+len(payload))
-		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-			return nil, nil, err
-		}
+		encrypted := cipher.Encrypt(nil, nonce, nil, payload)
 
-		encrypted := aead.Seal(nonce, nonce, payload, nil)
-		currentData = encrypted
+		// Prepend: [nonce: 8 bytes][ciphertext]
+		out := make([]byte, 8+len(encrypted))
+		copy(out[:8], nonceArr[:])
+		copy(out[8:], encrypted)
+		currentData = out
 	}
 
 	return currentData, keys, nil
 }
 
-// Decrypt decrypts layered encrypted data
-// Keys should be provided in reverse order (outermost to innermost)
+// Decrypt decrypts layered encrypted data produced by Encrypt.
 func (e *LayeredEncrypter) Decrypt(ciphertext []byte, keys []*EncryptionKey) ([]byte, error) {
 	if len(keys) != e.hopCount {
 		return nil, fmt.Errorf("expected %d keys, got %d", e.hopCount, len(keys))
 	}
 
-	// Decrypt from outside in
 	currentData := ciphertext
 
 	for i := 0; i < e.hopCount; i++ {
-		aead, err := chacha20poly1305.NewX(keys[i].Key)
+		if len(currentData) < 8 {
+			return nil, fmt.Errorf("ciphertext too short for hop %d", i)
+		}
+
+		nonce := binary.LittleEndian.Uint64(currentData[:8])
+		ciphered := currentData[8:]
+
+		var cipherKey [32]byte
+		copy(cipherKey[:], keys[i].Key)
+		cipher := noiseSuite.Cipher(cipherKey)
+
+		plaintext, err := cipher.Decrypt(nil, nonce, nil, ciphered)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decryption failed for hop %d: %w", i, err)
 		}
 
-		nonceSize := aead.NonceSize()
-		if len(currentData) < nonceSize {
-			return nil, fmt.Errorf("ciphertext too short")
-		}
-
-		nonce, ciphertext := currentData[:nonceSize], currentData[nonceSize:]
-
-		plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		// Extract destination from header
+		// Parse header: [dest_len: 2][dest_bytes][ephemeral_pub: 32][payload...]
 		if len(plaintext) < 2 {
-			return nil, fmt.Errorf("invalid header: too short")
+			return nil, fmt.Errorf("invalid header at hop %d", i)
 		}
-		offset := 0
 		destLen := int(binary.LittleEndian.Uint16(plaintext[0:2]))
-		offset += 2
-
-		_, n := binary.Uvarint(plaintext[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid varint in header")
+		headerSize := 2 + destLen + 32
+		if len(plaintext) < headerSize {
+			return nil, fmt.Errorf("invalid header size at hop %d", i)
 		}
-		offset += n
-
-		if len(plaintext) < offset+destLen {
-			return nil, fmt.Errorf("invalid destination length")
-		}
-
-		// Verify destination matches (optional security check)
-		extractedDest := string(plaintext[offset : offset+destLen])
-		if extractedDest != keys[i].Destination {
-			// Continue anyway - this is a integrity check, not a security bypass
-		}
-
-		// Remaining is the decrypted payload for next layer
-		currentData = plaintext[offset+destLen:]
+		currentData = plaintext[headerSize:]
 	}
 
 	return currentData, nil
 }
 
-// SecureErase securely wipes all key material from memory (Req 16.3).
-// Uses explicit byte-level zeroing that cannot be optimized away by the compiler
-// via the use of the runtime.KeepAlive barrier (via unsafe indirect write).
 func SecureEraseBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
@@ -155,10 +149,6 @@ func SecureEraseBytes(b []byte) {
 }
 
 // SecureErase implements the Eraser interface (Req 16.3).
-// Callers are responsible for passing the key slices they wish to erase;
-// this method is intentionally a no-op on the encrypter itself because
-// keys are generated and held by the caller (not stored inside
-// LayeredEncrypter).  Use SecureEraseBytes on the EncryptionKey.Key slices.
 func (e *LayeredEncrypter) SecureErase() {}
 
 // EraseKeys zeroes out all key material in the provided keys slice (Req 16.3).
@@ -166,14 +156,13 @@ func EraseKeys(keys []*EncryptionKey) {
 	for _, k := range keys {
 		if k != nil {
 			SecureEraseBytes(k.Key)
+			SecureEraseBytes(k.EphemeralPub)
 		}
 	}
 }
 
 // HopCount returns the number of encryption layers
-func (e *LayeredEncrypter) HopCount() int {
-	return e.hopCount
-}
+func (e *LayeredEncrypter) HopCount() int { return e.hopCount }
 
 // Eraser interface for secure key erasure
 type Eraser interface {

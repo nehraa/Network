@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -13,6 +14,12 @@ import (
 	ping "github.com/libp2p/go-libp2p/p2p/protocol/ping"
 )
 
+// rttCacheEntry holds a cached RTT measurement.
+type rttCacheEntry struct {
+	latency   time.Duration
+	timestamp time.Time
+}
+
 // RelayDiscovery handles finding relays via DHT
 type RelayDiscovery struct {
 	protocolID    string
@@ -20,6 +27,8 @@ type RelayDiscovery struct {
 	selectionMode string // "rtt", "random", "hybrid"
 	host          host.Host
 	pingService   *ping.PingService
+	rttCache      map[peer.ID]*rttCacheEntry
+	cacheMu       sync.RWMutex
 }
 
 // RelayInfo holds information about a potential relay
@@ -36,6 +45,7 @@ func NewRelayDiscovery(protocolID string, samplingSize int, selectionMode string
 		protocolID:    protocolID,
 		samplingSize:  samplingSize,
 		selectionMode: selectionMode,
+		rttCache:      make(map[peer.ID]*rttCacheEntry),
 	}
 }
 
@@ -49,6 +59,7 @@ func NewRelayDiscoveryWithHost(h host.Host, protocolID string, samplingSize int,
 		selectionMode: selectionMode,
 		host:          h,
 		pingService:   ps,
+		rttCache:      make(map[peer.ID]*rttCacheEntry),
 	}
 }
 
@@ -230,12 +241,20 @@ func (r *RelayDiscovery) measureLatencies(ctx context.Context, peers []peer.Addr
 }
 
 // measureRTTToPeer measures round-trip time to a peer using the libp2p ping
-// protocol (Req 5.1).  This is transport-agnostic: it works over TCP, QUIC,
-// WebRTC, and any other transport supported by the host (Req 11.2).
+// protocol (Req 5.1).  Results are cached for 60 seconds (Issue 18).
 func (r *RelayDiscovery) measureRTTToPeer(ctx context.Context, addrInfo peer.AddrInfo) (time.Duration, error) {
 	if r.pingService == nil {
 		return 0, fmt.Errorf("ping service not configured")
 	}
+
+	// Check cache first (Issue 18)
+	r.cacheMu.RLock()
+	if entry, ok := r.rttCache[addrInfo.ID]; ok && time.Since(entry.timestamp) < 60*time.Second {
+		rtt := entry.latency
+		r.cacheMu.RUnlock()
+		return rtt, nil
+	}
+	r.cacheMu.RUnlock()
 
 	// Ensure we are connected before pinging.
 	if r.host.Network().Connectedness(addrInfo.ID) != network.Connected {
@@ -262,7 +281,11 @@ func (r *RelayDiscovery) measureRTTToPeer(ctx context.Context, addrInfo peer.Add
 		if res.Error != nil {
 			return 0, fmt.Errorf("ping error for peer %s: %w", addrInfo.ID, res.Error)
 		}
-		return res.RTT, nil
+		rtt := res.RTT
+		r.cacheMu.Lock()
+		r.rttCache[addrInfo.ID] = &rttCacheEntry{latency: rtt, timestamp: time.Now()}
+		r.cacheMu.Unlock()
+		return rtt, nil
 	}
 }
 

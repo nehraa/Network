@@ -2,11 +2,16 @@ package circuit
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/flynn/noise"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -43,21 +48,24 @@ func (h *StreamHandler) Stream() network.Stream {
 
 // CircuitManager manages circuit lifecycle
 type CircuitManager struct {
-	cfg       *CircuitConfig
-	circuits  map[string]*Circuit
-	relayPool []peer.ID
-	threshold int
-	host      host.Host
-	streams   map[string]*StreamHandler // circuitID -> stream handler
-	mu        sync.RWMutex
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg          *CircuitConfig
+	circuits     map[string]*Circuit
+	relayPool    []peer.ID
+	threshold    int
+	host         host.Host
+	streams      map[string]*StreamHandler // circuitID -> stream handler
+	noiseKeypair noise.DHKey
+	failureCh    chan string
+	mu           sync.RWMutex
+	wg           sync.WaitGroup
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // NewCircuitManager creates a new circuit manager
 func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
-	threshold := cfg.CircuitCount - 1
+	// threshold = ceil(CircuitCount * 0.6) per design document (60% reconstruction threshold)
+	threshold := (cfg.CircuitCount*6 + 9) / 10
 	if threshold < 1 {
 		threshold = 1
 	}
@@ -67,15 +75,22 @@ func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 		streamTimeout = 30 * time.Second
 	}
 
+	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate noise keypair for circuit manager: %v", err))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &CircuitManager{
-		cfg:        cfg,
-		circuits:   make(map[string]*Circuit),
-		threshold:  threshold,
-		streams:    make(map[string]*StreamHandler),
-		ctx:        ctx,
-		cancel:     cancel,
+		cfg:          cfg,
+		circuits:     make(map[string]*Circuit),
+		threshold:    threshold,
+		streams:      make(map[string]*StreamHandler),
+		noiseKeypair: kp,
+		failureCh:    make(chan string, 10),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -156,12 +171,92 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 		return fmt.Errorf("failed to open stream to %s: %w", entryPeer, err)
 	}
 
+	// Set stream deadline (Issue 6)
+	if err := stream.SetDeadline(time.Now().Add(m.cfg.StreamTimeout)); err != nil {
+		stream.Close()
+		return fmt.Errorf("failed to set stream deadline: %w", err)
+	}
+
+	// Perform Noise XX handshake as initiator (Issue 14)
+	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	initiatorCfg := noise.Config{
+		CipherSuite:   cs,
+		Random:        cryptorand.Reader,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     true,
+		StaticKeypair: m.noiseKeypair,
+	}
+	hs, err := noise.NewHandshakeState(initiatorCfg)
+	if err != nil {
+		stream.Close()
+		return fmt.Errorf("failed to create noise handshake: %w", err)
+	}
+	// -> e
+	msg1, _, _, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		stream.Close()
+		return fmt.Errorf("noise write1: %w", err)
+	}
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(msg1)))
+	if _, err := stream.Write(append(lenBuf, msg1...)); err != nil {
+		stream.Close()
+		return fmt.Errorf("noise send1: %w", err)
+	}
+	// <- e, ee, s, es
+	resp := make([]byte, 4096)
+	n, err := stream.Read(resp)
+	if err != nil {
+		stream.Close()
+		return fmt.Errorf("noise read2: %w", err)
+	}
+	if _, _, _, err = hs.ReadMessage(nil, resp[:n]); err != nil {
+		stream.Close()
+		return fmt.Errorf("noise parse2: %w", err)
+	}
+	// -> s, se
+	msg3, _, _, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		stream.Close()
+		return fmt.Errorf("noise write3: %w", err)
+	}
+	if _, err := stream.Write(msg3); err != nil {
+		stream.Close()
+		return fmt.Errorf("noise send3: %w", err)
+	}
+
 	m.mu.Lock()
 	m.streams[circuit.ID] = &StreamHandler{
 		stream: stream,
 		peerID: entryPeer,
 	}
 	m.mu.Unlock()
+
+	// Watch the circuit stream for unexpected disconnects (Issue 15)
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		buf := make([]byte, 1)
+		for {
+			select {
+			case <-m.ctx.Done():
+				return
+			default:
+			}
+			stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_, err := stream.Read(buf)
+			if err != nil {
+				if !isTimeout(err) {
+					m.MarkCircuitFailed(circuit.ID)
+					select {
+					case m.failureCh <- circuit.ID:
+					default:
+					}
+				}
+				return
+			}
+		}
+	}()
 
 	return nil
 }
@@ -479,4 +574,20 @@ func (m *CircuitManager) GetStream(circuitID string) (*StreamHandler, bool) {
 
 	handler, ok := m.streams[circuitID]
 	return handler, ok
+}
+
+// FailureCh returns a channel that receives IDs of circuits that failed unexpectedly (Issue 15).
+func (m *CircuitManager) FailureCh() <-chan string {
+	return m.failureCh
+}
+
+// isTimeout returns true when err represents a network deadline/timeout.
+func isTimeout(err error) bool {
+	if os.IsTimeout(err) {
+		return true
+	}
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
+	}
+	return false
 }
