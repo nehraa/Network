@@ -80,10 +80,11 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 		payload := append(header, currentData...)
 
 		// Encrypt with Noise CipherChaChaPoly.
-		// Each key is ephemeral and used exactly once, so nonce=0 is cryptographically
-		// safe and avoids the birthday-bound concern that arises with random nonces
-		// when the same key could theoretically be reused.
-		const nonce = uint64(0)
+		// Nonce is derived from the first 8 bytes of the ephemeral public key.
+		// Each key is ephemeral and used exactly once; deriving the nonce from the
+		// public key binds it to the keypair and adds defense-in-depth against any
+		// accidental key reuse.
+		nonce := binary.LittleEndian.Uint64(keys[i].EphemeralPub[:8])
 		var cipherKey [32]byte
 		copy(cipherKey[:], keys[i].Key)
 		cipher := noiseSuite.Cipher(cipherKey)
@@ -108,7 +109,8 @@ func (e *LayeredEncrypter) Decrypt(ciphertext []byte, keys []*EncryptionKey) ([]
 			return nil, fmt.Errorf("ciphertext too short for hop %d", i)
 		}
 
-		const nonce = uint64(0)
+		// Nonce derived from first 8 bytes of the stored ephemeral public key (matches Encrypt).
+		nonce := binary.LittleEndian.Uint64(keys[i].EphemeralPub[:8])
 		var cipherKey [32]byte
 		copy(cipherKey[:], keys[i].Key)
 		cipher := noiseSuite.Cipher(cipherKey)

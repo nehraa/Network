@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"sync"
 	"time"
 
@@ -74,10 +75,12 @@ func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 		streamTimeout = 30 * time.Second
 	}
 
-	// Keypair generation uses /dev/urandom and essentially never fails in practice.
-	// On the rare OS-level error, EstablishCircuit will return an error during
-	// the Noise XX handshake rather than crashing the entire process.
-	kp, _ := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	// GenerateKeypair reads from crypto/rand.  This essentially never fails;
+	// an error here means the OS entropy source is broken, which is fatal.
+	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("mixnet circuit: failed to generate Noise static keypair: %v", err))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -211,7 +214,7 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 	msg2Len := int(binary.LittleEndian.Uint32(msg2LenBuf[:]))
 	if msg2Len <= 0 || msg2Len > 4096 {
 		stream.Close()
-		return fmt.Errorf("invalid noise msg2 length: %d", msg2Len)
+		return fmt.Errorf("invalid handshake message")
 	}
 	msg2 := make([]byte, msg2Len)
 	if _, err := io.ReadFull(stream, msg2); err != nil {
@@ -262,7 +265,7 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 				continue
 			}
 			// Distinguish timeout (deadline exceeded) from a real connection error.
-			if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				// Deadline expired — stream still alive, keep watching
 				continue
 			}

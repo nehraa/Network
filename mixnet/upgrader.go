@@ -418,7 +418,7 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 // parseShard parses shard data including 12-byte header (Issue 8).
 func (m *Mixnet) parseShard(data []byte) (*ces.Shard, string, error) {
 	if len(data) < 12 {
-		return nil, "", fmt.Errorf("shard header too short: got %d bytes, need 12", len(data))
+		return nil, "", fmt.Errorf("invalid shard format")
 	}
 
 	index := int(binary.LittleEndian.Uint32(data[0:4]))

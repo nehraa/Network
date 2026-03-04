@@ -50,10 +50,12 @@ type Handler struct {
 
 // NewHandler creates a new relay handler
 func NewHandler(host host.Host, maxCircuits int, maxBandwidth int64) *Handler {
-	// Keypair generation uses /dev/urandom and essentially never fails in practice.
-	// On the rare OS-level error, HandleStream will return an error during the
-	// Noise XX handshake rather than crashing the entire process.
-	kp, _ := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	// GenerateKeypair reads from crypto/rand.  This essentially never fails;
+	// an error here means the OS entropy source is broken, which is fatal.
+	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("mixnet relay: failed to generate Noise static keypair: %v", err))
+	}
 	return &Handler{
 		host:         host,
 		maxBandwidth: maxBandwidth,
@@ -114,7 +116,7 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 	}
 	msg1Len := int(binary.LittleEndian.Uint32(msg1LenBuf[:]))
 	if msg1Len <= 0 || msg1Len > 4096 {
-		return fmt.Errorf("invalid noise msg1 length: %d", msg1Len)
+		return fmt.Errorf("invalid handshake message")
 	}
 	msg1 := make([]byte, msg1Len)
 	if _, err := io.ReadFull(stream, msg1); err != nil {
@@ -140,7 +142,7 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 	}
 	msg3Len := int(binary.LittleEndian.Uint32(msg3LenBuf[:]))
 	if msg3Len <= 0 || msg3Len > 4096 {
-		return fmt.Errorf("invalid noise msg3 length: %d", msg3Len)
+		return fmt.Errorf("invalid handshake message")
 	}
 	msg3 := make([]byte, msg3Len)
 	if _, err := io.ReadFull(stream, msg3); err != nil {
