@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 
 	"github.com/flynn/noise"
 )
@@ -80,23 +79,17 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 
 		payload := append(header, currentData...)
 
-		// Encrypt with Noise CipherChaChaPoly
-		var nonceArr [8]byte
-		if _, err := io.ReadFull(cryptorand.Reader, nonceArr[:]); err != nil {
-			return nil, nil, fmt.Errorf("failed to generate nonce for hop %d: %w", i, err)
-		}
-		nonce := binary.LittleEndian.Uint64(nonceArr[:])
+		// Encrypt with Noise CipherChaChaPoly.
+		// Each key is ephemeral and used exactly once, so nonce=0 is cryptographically
+		// safe and avoids the birthday-bound concern that arises with random nonces
+		// when the same key could theoretically be reused.
+		const nonce = uint64(0)
 		var cipherKey [32]byte
 		copy(cipherKey[:], keys[i].Key)
 		cipher := noiseSuite.Cipher(cipherKey)
 
 		encrypted := cipher.Encrypt(nil, nonce, nil, payload)
-
-		// Prepend: [nonce: 8 bytes][ciphertext]
-		out := make([]byte, 8+len(encrypted))
-		copy(out[:8], nonceArr[:])
-		copy(out[8:], encrypted)
-		currentData = out
+		currentData = encrypted
 	}
 
 	return currentData, keys, nil
@@ -111,18 +104,16 @@ func (e *LayeredEncrypter) Decrypt(ciphertext []byte, keys []*EncryptionKey) ([]
 	currentData := ciphertext
 
 	for i := 0; i < e.hopCount; i++ {
-		if len(currentData) < 8 {
+		if len(currentData) < 1 {
 			return nil, fmt.Errorf("ciphertext too short for hop %d", i)
 		}
 
-		nonce := binary.LittleEndian.Uint64(currentData[:8])
-		ciphered := currentData[8:]
-
+		const nonce = uint64(0)
 		var cipherKey [32]byte
 		copy(cipherKey[:], keys[i].Key)
 		cipher := noiseSuite.Cipher(cipherKey)
 
-		plaintext, err := cipher.Decrypt(nil, nonce, nil, ciphered)
+		plaintext, err := cipher.Decrypt(nil, nonce, nil, currentData)
 		if err != nil {
 			return nil, fmt.Errorf("decryption failed for hop %d: %w", i, err)
 		}

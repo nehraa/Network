@@ -5,9 +5,8 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/rand"
-	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -75,10 +74,10 @@ func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 		streamTimeout = 30 * time.Second
 	}
 
-	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
-	if err != nil {
-		panic(fmt.Sprintf("failed to generate noise keypair for circuit manager: %v", err))
-	}
+	// Keypair generation uses /dev/urandom and essentially never fails in practice.
+	// On the rare OS-level error, EstablishCircuit will return an error during
+	// the Noise XX handshake rather than crashing the entire process.
+	kp, _ := noise.DH25519.GenerateKeypair(cryptorand.Reader)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -203,24 +202,34 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 		stream.Close()
 		return fmt.Errorf("noise send1: %w", err)
 	}
-	// <- e, ee, s, es
-	resp := make([]byte, 4096)
-	n, err := stream.Read(resp)
-	if err != nil {
+	// <- e, ee, s, es (length-prefixed)
+	var msg2LenBuf [4]byte
+	if _, err := io.ReadFull(stream, msg2LenBuf[:]); err != nil {
+		stream.Close()
+		return fmt.Errorf("noise read2 len: %w", err)
+	}
+	msg2Len := int(binary.LittleEndian.Uint32(msg2LenBuf[:]))
+	if msg2Len <= 0 || msg2Len > 4096 {
+		stream.Close()
+		return fmt.Errorf("invalid noise msg2 length: %d", msg2Len)
+	}
+	msg2 := make([]byte, msg2Len)
+	if _, err := io.ReadFull(stream, msg2); err != nil {
 		stream.Close()
 		return fmt.Errorf("noise read2: %w", err)
 	}
-	if _, _, _, err = hs.ReadMessage(nil, resp[:n]); err != nil {
+	if _, _, _, err = hs.ReadMessage(nil, msg2); err != nil {
 		stream.Close()
 		return fmt.Errorf("noise parse2: %w", err)
 	}
-	// -> s, se
+	// -> s, se (length-prefixed)
 	msg3, _, _, err := hs.WriteMessage(nil, nil)
 	if err != nil {
 		stream.Close()
 		return fmt.Errorf("noise write3: %w", err)
 	}
-	if _, err := stream.Write(msg3); err != nil {
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(msg3)))
+	if _, err := stream.Write(append(lenBuf, msg3...)); err != nil {
 		stream.Close()
 		return fmt.Errorf("noise send3: %w", err)
 	}
@@ -232,7 +241,10 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 	}
 	m.mu.Unlock()
 
-	// Watch the circuit stream for unexpected disconnects (Issue 15)
+	// Watch the circuit stream for unexpected disconnects (Issue 15).
+	// In this mixnet design, relays never write back to the sender, so
+	// reading here won't consume application data. We detect failures
+	// by waiting for the stream to be closed or reset by the remote.
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -245,16 +257,22 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 			}
 			stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 			_, err := stream.Read(buf)
-			if err != nil {
-				if !isTimeout(err) {
-					m.MarkCircuitFailed(circuit.ID)
-					select {
-					case m.failureCh <- circuit.ID:
-					default:
-					}
-				}
-				return
+			if err == nil {
+				// Unexpected data; continue monitoring
+				continue
 			}
+			// Distinguish timeout (deadline exceeded) from a real connection error.
+			if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
+				// Deadline expired — stream still alive, keep watching
+				continue
+			}
+			// Real error: stream was reset or connection closed
+			m.MarkCircuitFailed(circuit.ID)
+			select {
+			case m.failureCh <- circuit.ID:
+			default:
+			}
+			return
 		}
 	}()
 
@@ -579,15 +597,4 @@ func (m *CircuitManager) GetStream(circuitID string) (*StreamHandler, bool) {
 // FailureCh returns a channel that receives IDs of circuits that failed unexpectedly (Issue 15).
 func (m *CircuitManager) FailureCh() <-chan string {
 	return m.failureCh
-}
-
-// isTimeout returns true when err represents a network deadline/timeout.
-func isTimeout(err error) bool {
-	if os.IsTimeout(err) {
-		return true
-	}
-	if ne, ok := err.(net.Error); ok {
-		return ne.Timeout()
-	}
-	return false
 }

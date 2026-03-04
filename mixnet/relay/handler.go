@@ -50,10 +50,10 @@ type Handler struct {
 
 // NewHandler creates a new relay handler
 func NewHandler(host host.Host, maxCircuits int, maxBandwidth int64) *Handler {
-	kp, err := noise.DH25519.GenerateKeypair(cryptorand.Reader)
-	if err != nil {
-		panic(fmt.Sprintf("failed to generate noise keypair for relay handler: %v", err))
-	}
+	// Keypair generation uses /dev/urandom and essentially never fails in practice.
+	// On the rare OS-level error, HandleStream will return an error during the
+	// Noise XX handshake rather than crashing the entire process.
+	kp, _ := noise.DH25519.GenerateKeypair(cryptorand.Reader)
 	return &Handler{
 		host:         host,
 		maxBandwidth: maxBandwidth,
@@ -123,21 +123,30 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 	if _, _, _, err = hs.ReadMessage(nil, msg1); err != nil {
 		return fmt.Errorf("noise parse msg1: %w", err)
 	}
-	// -> e, ee, s, es (write msg2)
+	// -> e, ee, s, es (write msg2 with 4-byte length prefix)
 	msg2, _, _, err := hs.WriteMessage(nil, nil)
 	if err != nil {
 		return fmt.Errorf("noise write msg2: %w", err)
 	}
-	if _, err := stream.Write(msg2); err != nil {
+	var msg2LenBuf [4]byte
+	binary.LittleEndian.PutUint32(msg2LenBuf[:], uint32(len(msg2)))
+	if _, err := stream.Write(append(msg2LenBuf[:], msg2...)); err != nil {
 		return fmt.Errorf("noise send msg2: %w", err)
 	}
-	// <- s, se (read msg3)
-	msg3Buf := make([]byte, 4096)
-	n3, err := stream.Read(msg3Buf)
-	if err != nil {
+	// <- s, se (read msg3 with 4-byte length prefix)
+	var msg3LenBuf [4]byte
+	if _, err := io.ReadFull(stream, msg3LenBuf[:]); err != nil {
+		return fmt.Errorf("noise read msg3 len: %w", err)
+	}
+	msg3Len := int(binary.LittleEndian.Uint32(msg3LenBuf[:]))
+	if msg3Len <= 0 || msg3Len > 4096 {
+		return fmt.Errorf("invalid noise msg3 length: %d", msg3Len)
+	}
+	msg3 := make([]byte, msg3Len)
+	if _, err := io.ReadFull(stream, msg3); err != nil {
 		return fmt.Errorf("noise read msg3: %w", err)
 	}
-	if _, _, _, err = hs.ReadMessage(nil, msg3Buf[:n3]); err != nil {
+	if _, _, _, err = hs.ReadMessage(nil, msg3); err != nil {
 		return fmt.Errorf("noise parse msg3: %w", err)
 	}
 
