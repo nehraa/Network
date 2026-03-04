@@ -113,49 +113,49 @@ func (h *Handler) HandleStream(stream network.Stream) {
 	}
 	hs, err := noise.NewHandshakeState(responderCfg)
 	if err != nil {
-		return fmt.Errorf("noise handshake setup: %w", err)
+		return
 	}
 	// <- e (read msg1: 4-byte length prefix + payload)
 	var msg1LenBuf [4]byte
 	if _, err := io.ReadFull(stream, msg1LenBuf[:]); err != nil {
-		return fmt.Errorf("noise read msg1 len: %w", err)
+		return
 	}
 	msg1Len := int(binary.LittleEndian.Uint32(msg1LenBuf[:]))
 	if msg1Len <= 0 || msg1Len > 4096 {
-		return fmt.Errorf("invalid handshake message")
+		return
 	}
 	msg1 := make([]byte, msg1Len)
 	if _, err := io.ReadFull(stream, msg1); err != nil {
-		return fmt.Errorf("noise read msg1: %w", err)
+		return
 	}
 	if _, _, _, err = hs.ReadMessage(nil, msg1); err != nil {
-		return fmt.Errorf("noise parse msg1: %w", err)
+		return
 	}
 	// -> e, ee, s, es (write msg2 with 4-byte length prefix)
 	msg2, _, _, err := hs.WriteMessage(nil, nil)
 	if err != nil {
-		return fmt.Errorf("noise write msg2: %w", err)
+		return
 	}
 	var msg2LenBuf [4]byte
 	binary.LittleEndian.PutUint32(msg2LenBuf[:], uint32(len(msg2)))
 	if _, err := stream.Write(append(msg2LenBuf[:], msg2...)); err != nil {
-		return fmt.Errorf("noise send msg2: %w", err)
+		return
 	}
 	// <- s, se (read msg3 with 4-byte length prefix)
 	var msg3LenBuf [4]byte
 	if _, err := io.ReadFull(stream, msg3LenBuf[:]); err != nil {
-		return fmt.Errorf("noise read msg3 len: %w", err)
+		return
 	}
 	msg3Len := int(binary.LittleEndian.Uint32(msg3LenBuf[:]))
 	if msg3Len <= 0 || msg3Len > 4096 {
-		return fmt.Errorf("invalid handshake message")
+		return
 	}
 	msg3 := make([]byte, msg3Len)
 	if _, err := io.ReadFull(stream, msg3); err != nil {
-		return fmt.Errorf("noise read msg3: %w", err)
+		return
 	}
 	if _, _, _, err = hs.ReadMessage(nil, msg3); err != nil {
-		return fmt.Errorf("noise parse msg3: %w", err)
+		return
 	}
 
 	// Read destination length (2 bytes, little-endian).
