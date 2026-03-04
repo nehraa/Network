@@ -438,10 +438,11 @@ func (m *CircuitManager) StartHealthMonitor(checkInterval time.Duration, failure
 				m.mu.RUnlock()
 
 				for _, circuitID := range active {
-					// Send a 1-byte probe through the encrypted Noise channel
-					probe := []byte{0xFE}
-					err := m.SendData(circuitID, probe)
-					if err != nil {
+					// Heartbeat: send a zero-length routing packet (Req 10.1).
+					// The relay handler recognises destLen==0 as a keepalive and
+					// returns nil without forwarding, validating the stream is alive.
+					probe := []byte{0x00, 0x00} // [dest_len:2 = 0] — no dest, no payload
+					if err := m.SendData(circuitID, probe); err != nil {
 						m.MarkCircuitFailed(circuitID)
 						if failureCallback != nil {
 							failureCallback(circuitID)

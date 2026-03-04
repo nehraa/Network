@@ -110,10 +110,10 @@ func (c *MixnetConfig) Validate() error {
 		return fmt.Errorf("randomness factor must be between 0.0 and 1.0, got %f", c.RandomnessFactor)
 	}
 
-	// CompressionLevel validation for gzip (0-9): 0 = default, 1-9 = explicit (Req 15)
+	// CompressionLevel validation for gzip (0 = use default, 1-9 = explicit) (Req 15)
 	if c.Compression == "gzip" && c.CompressionLevel != 0 {
 		if c.CompressionLevel < 1 || c.CompressionLevel > 9 {
-			return fmt.Errorf("gzip compression level must be between 0 and 9, got %d", c.CompressionLevel)
+			return fmt.Errorf("gzip compression level must be 1-9 (use 0 for default), got %d", c.CompressionLevel)
 		}
 	}
 

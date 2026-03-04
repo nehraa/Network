@@ -118,8 +118,15 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 	if int(destLen) > len(decrypted)-2 {
 		return fmt.Errorf("invalid destination length: %d", destLen)
 	}
+	if destLen == 0 {
+		// Zero-length destination: heartbeat / keepalive probe; no forwarding needed.
+		return nil
+	}
 	nextHop := string(decrypted[2 : 2+destLen])
 	payload := decrypted[2+destLen:]
+	if len(payload) == 0 {
+		return fmt.Errorf("empty payload for next hop %s", nextHop)
+	}
 
 	// Parse the next hop as a peer ID; fall back to multiaddr parsing.
 	nextPeer, err := peer.Decode(nextHop)
@@ -130,7 +137,14 @@ func (h *Handler) HandleStream(ctx context.Context, stream network.Stream) error
 	return h.forwardToPeerStream(ctx, nextPeer, payload)
 }
 
-// forwardToPeerStream opens a stream to nextPeer and writes the decrypted payload (Req 7.4, 14.3, 20.4).
+// forwardToPeerStream opens a stream to nextPeer, performs a Noise NN handshake
+// (relay is the initiator), then sends the payload as one length-framed
+// Noise-encrypted message (Req 7.4, 14.3, 16.2, 20.4).
+//
+// The recipient's HandleStream or handleIncomingStream will:
+//  1. Complete the Noise NN responder handshake.
+//  2. Read the length-prefixed encrypted message.
+//  3. Noise-decrypt to obtain the inner routing packet or shard data.
 func (h *Handler) forwardToPeerStream(ctx context.Context, nextPeer peer.ID, payload []byte) error {
 	h.mu.RLock()
 	host := h.host
@@ -155,19 +169,35 @@ func (h *Handler) forwardToPeerStream(ctx context.Context, nextPeer peer.ID, pay
 	}
 	defer dst.Close()
 
-	// Apply bandwidth limit as a rate-limited writer if configured (Req 20.2, 20.4).
+	// Noise NN handshake: relay is initiator for forwarding streams (Req 16.2).
+	sendCS, _, err := noiseutil.PerformHandshake(dst, true)
+	if err != nil {
+		return fmt.Errorf("noise handshake with next hop failed: %w", err)
+	}
+
+	// Apply bandwidth limit if configured (Req 20.2, 20.4).
+	// Write through a rate-limited wrapper if needed.
+	out, err := sendCS.Encrypt(nil, nil, payload)
+	if err != nil {
+		return fmt.Errorf("noise encrypt for forwarding failed: %w", err)
+	}
+
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(out)))
+	data := append(lenBuf, out...)
+
 	var writer io.Writer = dst
 	if maxBandwidth > 0 {
 		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 	}
-
-	if _, err := writer.Write(payload); err != nil {
+	if _, err := writer.Write(data); err != nil {
 		return fmt.Errorf("failed to forward payload: %w", err)
 	}
 	return nil
 }
 
-// forwardByAddress parses addr as a multiaddr peer info string and forwards the payload there.
+// forwardByAddress parses addr as a multiaddr peer info string, performs a
+// Noise NN handshake (relay initiator), then sends payload as one framed message.
 func (h *Handler) forwardByAddress(ctx context.Context, addr string, payload []byte) error {
 	h.mu.RLock()
 	host := h.host
@@ -195,7 +225,19 @@ func (h *Handler) forwardByAddress(ctx context.Context, addr string, payload []b
 	}
 	defer dst.Close()
 
-	if _, err := dst.Write(payload); err != nil {
+	// Noise NN handshake: relay is initiator (Req 16.2).
+	sendCS, _, err := noiseutil.PerformHandshake(dst, true)
+	if err != nil {
+		return fmt.Errorf("noise handshake with next hop failed: %w", err)
+	}
+
+	out, err := sendCS.Encrypt(nil, nil, payload)
+	if err != nil {
+		return fmt.Errorf("noise encrypt for forwarding failed: %w", err)
+	}
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(out)))
+	if _, err := dst.Write(append(lenBuf, out...)); err != nil {
 		return fmt.Errorf("failed to forward payload: %w", err)
 	}
 	return nil

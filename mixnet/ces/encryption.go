@@ -15,11 +15,13 @@ type LayeredEncrypter struct {
 	hopCount int
 }
 
-// EncryptionKey represents an ephemeral key for one encryption layer
+// EncryptionKey represents an ephemeral key for one encryption layer.
+// Each key is generated fresh per Encrypt call via GenerateKeypair, so a
+// fixed nonce of 0 never causes nonce reuse with the same key (Req 16.2).
 type EncryptionKey struct {
-	Key         []byte // Curve25519 private key
+	Key         []byte // Curve25519 private key (ephemeral, new per Encrypt call)
 	Destination string
-	nonce       uint64 // counter-based nonce, initialized to 0
+	nonce       uint64 // always 0; safe because Key is ephemeral (single-use)
 }
 
 // NewLayeredEncrypter creates a new layered encrypter
@@ -29,9 +31,17 @@ func NewLayeredEncrypter(hopCount int) *LayeredEncrypter {
 	}
 }
 
-// Encrypt encrypts data with layered encryption (onion routing)
-// Each layer wraps the data with destination info and encryption
-// Destinations should be ordered from entry to exit (first hop = entry)
+// Encrypt encrypts data using onion routing format (Req 3.3, 14, 16.2).
+//
+// The output format is:
+//
+//	[hop0_dest_len:2][hop0_dest_bytes][hop1_dest_len:2][hop1_dest_bytes]...[Encrypt_K(plaintext)]
+//
+// Routing headers are plaintext so each relay can read its next hop after
+// decrypting its Noise transport layer (Req 14.1, 14.3).  Only the innermost
+// data payload is content-encrypted with the last hop's ephemeral key.
+//
+// Destinations should be ordered from entry hop to exit hop (first = entry).
 func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]byte, []*EncryptionKey, error) {
 	if len(destinations) != e.hopCount {
 		return nil, nil, fmt.Errorf("expected %d destinations, got %d", e.hopCount, len(destinations))
@@ -39,7 +49,7 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 
 	keys := make([]*EncryptionKey, e.hopCount)
 
-	// Generate ephemeral Curve25519 keypair for each layer (Req 16.2)
+	// Generate ephemeral Curve25519 keypair for each layer (Req 16.2).
 	for i := 0; i < e.hopCount; i++ {
 		kp, err := mixnetCipherSuite.GenerateKeypair(rand.Reader)
 		if err != nil {
@@ -51,65 +61,59 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 		}
 	}
 
-	// Build encrypted payload from outside in (reverse order for onion)
-	// Start with innermost layer (exit relay)
-	currentData := plaintext
+	// Encrypt the data payload using the innermost hop's key (Req 16.2).
+	// Intermediate relays only see their own routing header; they cannot read
+	// the encrypted content (Req 14.2, 14.4).
+	var encryptedData []byte
+	{
+		last := keys[e.hopCount-1]
+		var k [32]byte
+		copy(k[:], last.Key)
+		noiseCipher := noise.CipherChaChaPoly.Cipher(k)
+		encryptedData = noiseCipher.Encrypt(nil, last.nonce, nil, plaintext)
+	}
 
+	// Prepend per-hop routing headers (outermost first) in plaintext.
+	// Format: [dest_len:2LE][dest_bytes] repeated hopCount times, then encrypted payload.
+	result := encryptedData
 	for i := e.hopCount - 1; i >= 0; i-- {
-		// Build header: [dest_len:2][dest_bytes]
 		destBytes := []byte(keys[i].Destination)
 		header := make([]byte, 2+len(destBytes))
 		binary.LittleEndian.PutUint16(header[0:2], uint16(len(destBytes)))
 		copy(header[2:], destBytes)
-
-		// Prepend header to data
-		payload := append(header, currentData...)
-
-		// Encrypt with Noise ChaCha20-Poly1305 using counter nonce (Req 16.2)
-		var k [32]byte
-		copy(k[:], keys[i].Key)
-		noiseCipher := noise.CipherChaChaPoly.Cipher(k)
-		encrypted := noiseCipher.Encrypt(nil, keys[i].nonce, nil, payload)
-		currentData = encrypted
+		result = append(header, result...)
 	}
 
-	return currentData, keys, nil
+	return result, keys, nil
 }
 
-// Decrypt decrypts layered encrypted data
-// Keys should be provided in reverse order (outermost to innermost)
+// Decrypt decrypts data produced by Encrypt.
+// Keys should be provided in the same order as used during Encrypt (entry first).
 func (e *LayeredEncrypter) Decrypt(ciphertext []byte, keys []*EncryptionKey) ([]byte, error) {
 	if len(keys) != e.hopCount {
 		return nil, fmt.Errorf("expected %d keys, got %d", e.hopCount, len(keys))
 	}
 
-	// Decrypt from outside in
-	currentData := ciphertext
-
+	// Strip hopCount plain-text routing headers.
+	data := ciphertext
 	for i := 0; i < e.hopCount; i++ {
-		var k [32]byte
-		copy(k[:], keys[i].Key)
-		noiseCipher := noise.CipherChaChaPoly.Cipher(k)
-
-		plaintext, err := noiseCipher.Decrypt(nil, keys[i].nonce, nil, currentData)
-		if err != nil {
-			return nil, err
+		if len(data) < 2 {
+			return nil, fmt.Errorf("invalid header at hop %d: too short", i)
 		}
-
-		// Extract destination from header: [dest_len:2][dest_bytes][data]
-		if len(plaintext) < 2 {
-			return nil, fmt.Errorf("invalid header: too short")
+		destLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		if len(data) < 2+destLen {
+			return nil, fmt.Errorf("invalid destination length at hop %d", i)
 		}
-		destLen := int(binary.LittleEndian.Uint16(plaintext[0:2]))
-		if len(plaintext) < 2+destLen {
-			return nil, fmt.Errorf("invalid destination length")
-		}
-
-		// Remaining is the decrypted payload for next layer
-		currentData = plaintext[2+destLen:]
+		// Skip this hop's routing header.
+		data = data[2+destLen:]
 	}
 
-	return currentData, nil
+	// Decrypt the payload using the innermost hop's key.
+	last := keys[e.hopCount-1]
+	var k [32]byte
+	copy(k[:], last.Key)
+	noiseCipher := noise.CipherChaChaPoly.Cipher(k)
+	return noiseCipher.Decrypt(nil, last.nonce, nil, data)
 }
 
 // SecureErase securely wipes all key material from memory (Req 16.3).

@@ -84,7 +84,9 @@ func (r *RelayDiscovery) filterPeers(peers []peer.AddrInfo) []peer.AddrInfo {
 }
 
 // FilterByProtocol filters peers to those that support the mixnet protocol (Req 12.2).
-// Peers not yet connected are included tentatively (verification happens at stream open).
+// Peers whose protocol list is unknown (not yet connected) are included tentatively
+// since they will be verified at stream-open time.
+// Peers that are connected but do NOT list the required protocol are excluded.
 func (r *RelayDiscovery) FilterByProtocol(peers []peer.AddrInfo) []peer.AddrInfo {
 	if r.host == nil {
 		return peers // Can't verify without host
@@ -93,8 +95,14 @@ func (r *RelayDiscovery) FilterByProtocol(peers []peer.AddrInfo) []peer.AddrInfo
 	for _, p := range peers {
 		protocols, err := r.host.Peerstore().GetProtocols(p.ID)
 		if err != nil {
-			// Not connected yet, include tentatively (will fail at stream open)
-			verified = append(verified, p)
+			// GetProtocols returns an error when the peer is not in the peerstore
+			// (i.e., we have not connected to it yet).  Include tentatively so we
+			// can attempt connection; the stream open will reject incompatible peers.
+			if r.host.Network().Connectedness(p.ID) != network.Connected {
+				verified = append(verified, p)
+			}
+			// If we ARE connected but GetProtocols still errors, skip the peer
+			// because we cannot verify its capabilities reliably.
 			continue
 		}
 		for _, proto := range protocols {

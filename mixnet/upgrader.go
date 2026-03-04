@@ -2,7 +2,9 @@ package mixnet
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/mixnet/ces"
 	"github.com/libp2p/go-libp2p/mixnet/circuit"
 	"github.com/libp2p/go-libp2p/mixnet/discovery"
+	noiseutil "github.com/libp2p/go-libp2p/mixnet/internal/noiseutil"
 	"github.com/libp2p/go-libp2p/mixnet/relay"
 
 	"github.com/ipfs/go-cid"
@@ -186,20 +189,29 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 	go m.destHandler.waitForData()
 
 	// Start circuit health monitor (Req 10.1).
+	// The failure callback is rate-limited to a single concurrent recovery
+	// attempt per invocation to prevent goroutine explosion.
+	recoverSem := make(chan struct{}, 1) // at most 1 concurrent recovery
 	m.circuitMgr.StartHealthMonitor(10*time.Second, func(circuitID string) {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			m.mu.RLock()
-			dests := make([]peer.ID, 0, len(m.activeConnections))
-			for dest := range m.activeConnections {
-				dests = append(dests, dest)
-			}
-			m.mu.RUnlock()
-			for _, dest := range dests {
-				_ = m.RecoverFromFailure(ctx, dest)
-			}
-		}()
+		select {
+		case recoverSem <- struct{}{}:
+			go func() {
+				defer func() { <-recoverSem }()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				m.mu.RLock()
+				dests := make([]peer.ID, 0, len(m.activeConnections))
+				for dest := range m.activeConnections {
+					dests = append(dests, dest)
+				}
+				m.mu.RUnlock()
+				for _, dest := range dests {
+					_ = m.RecoverFromFailure(ctx, dest)
+				}
+			}()
+		default:
+			// Recovery already in progress; skip this trigger.
+		}
 	})
 
 	return m, nil
@@ -334,7 +346,15 @@ func (m *Mixnet) getSampleRelays(ctx context.Context, dest peer.ID) ([]circuit.R
 	return nil, fmt.Errorf("no DHT configured and no sample relays available")
 }
 
-// Send sends data through the mixnet to the destination using per-circuit routing (Req 8, 14)
+// Send sends data through the mixnet to the destination using per-circuit routing (Req 8, 14).
+//
+// Data flow:
+//  1. Compress + shard the data.
+//  2. For each shard, build a CES routing packet (Req 14.1):
+//     [hop1_dest_len:2][hop1_dest][hop2_dest_len:2][hop2_dest]...[Encrypt_K([shard_idx:4][shard_data])]
+//     Routing headers are plaintext (each relay reads its next-hop), content is encrypted.
+//  3. SendData Noise-encrypts the routing packet and writes it length-prefixed.
+//  4. Each relay decrypts its Noise layer, reads its routing header, forwards the rest.
 func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 	circuits := m.circuitMgr.ListCircuits()
 	activeCircuits := make([]*circuit.Circuit, 0)
@@ -350,69 +370,75 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 	originalSize := len(data)
 	sendCount := len(activeCircuits)
 
-	// Build per-circuit routing paths (Req 14.1 - each relay only knows next hop)
-	circuitPaths := make([][]string, sendCount)
-	for i, circ := range activeCircuits {
-		path := make([]string, m.config.HopCount)
-		for j := 0; j < m.config.HopCount; j++ {
-			if j < len(circ.Peers)-1 {
-				path[j] = circ.Peers[j+1].String()
-			} else {
-				path[j] = dest.String()
-			}
-		}
-		circuitPaths[i] = path
-	}
-
-	// Process through CES pipeline with per-circuit encryption (Req 14)
-	shards, perShardKeys, err := m.pipeline.ProcessPerCircuit(data, circuitPaths)
+	// Step 1: Compress + shard (same for all circuits)
+	compressed, err := m.pipeline.Compressor().Compress(data)
 	if err != nil {
-		return fmt.Errorf("CES pipeline failed: %w", err)
+		return fmt.Errorf("compression failed: %w", err)
 	}
-
-	// Store per-circuit keys in KeyManager (Req 16.1)
-	for i, circ := range activeCircuits {
-		if i < len(perShardKeys) && perShardKeys[i] != nil {
-			m.keyManager.StoreCircuitKeys(circ.ID, [][]*ces.EncryptionKey{perShardKeys[i]})
-		}
+	shards, err := m.pipeline.Sharder().Shard(compressed)
+	if err != nil {
+		return fmt.Errorf("sharding failed: %w", err)
 	}
 
 	// Record compression ratio
-	m.metrics.RecordCompressionRatio(originalSize, len(data))
+	m.metrics.RecordCompressionRatio(originalSize, len(compressed))
 
 	// Transmit shards in parallel across circuits (Req 8)
 	var wg sync.WaitGroup
 	errCh := make(chan error, sendCount)
 
 	for i := 0; i < sendCount && i < len(shards); i++ {
-		circuitID := activeCircuits[i].ID
+		circ := activeCircuits[i]
 		shard := shards[i]
 
+		// Build per-circuit routing path (Req 14.1: each relay sees only its next hop).
+		path := make([]string, m.config.HopCount)
+		for j := 0; j < m.config.HopCount; j++ {
+			if j < len(circ.Peers)-1 {
+				// Intermediate hop: routing header shows the NEXT relay.
+				path[j] = circ.Peers[j+1].String()
+			} else {
+				// Final hop: routing header shows the actual destination.
+				path[j] = dest.String()
+			}
+		}
+
+		// Build inner payload: [shard_idx:4][raw_shard_data]
+		// This is what the destination ultimately receives after decrypting the CES layer.
+		innerPayload := make([]byte, 4+len(shard.Data))
+		binary.LittleEndian.PutUint32(innerPayload[0:4], uint32(i))
+		copy(innerPayload[4:], shard.Data)
+
+		// CES-encrypt the inner payload with per-circuit routing path (Req 14, 16.2).
+		// Output: [hop0_dest_len:2][hop0_dest]...[hopN_dest_len:2][hopN_dest][Encrypt_K(innerPayload)]
+		routingPacket, keys, err := m.pipeline.Encrypter().Encrypt(innerPayload, path)
+		if err != nil {
+			errCh <- fmt.Errorf("circuit %s: encryption failed: %w", circ.ID, err)
+			continue
+		}
+
+		// Store per-circuit keys in KeyManager (Req 16.1).
+		m.keyManager.StoreCircuitKeys(circ.ID, [][]*ces.EncryptionKey{keys})
+
 		wg.Add(1)
-		go func(shardData []byte, cID string, idx int) {
+		go func(packet []byte, cID string, circLen int) {
 			defer wg.Done()
 
-			// Apply per-stream write deadline (Req 8.2).
-			if stream, ok := m.circuitMgr.GetStream(cID); ok && stream != nil {
-				stream.Stream().SetDeadline(time.Now().Add(30 * time.Second))
+			// Apply per-stream write deadline.
+			if sh, ok := m.circuitMgr.GetStream(cID); ok && sh != nil {
+				sh.Stream().SetDeadline(time.Now().Add(30 * time.Second))
 			}
 
-			// Build routing packet: [shard_idx:4][shard_data]
-			header := make([]byte, 4)
-			header[0] = byte(idx)
-			header[1] = byte(idx >> 8)
-			header[2] = byte(idx >> 16)
-			header[3] = byte(idx >> 24)
-			fullData := append(header, shardData...)
-
+			// SendData Noise-encrypts the routing packet and frames it (Req 16.2).
 			var sendErr error
 			maxRetries := 3
 			for attempt := 0; attempt < maxRetries; attempt++ {
-				sendErr = m.circuitMgr.SendData(cID, fullData)
+				sendErr = m.circuitMgr.SendData(cID, packet)
 				if sendErr == nil {
 					break
 				}
-				if !IsRetryable(ErrTransportFailed(sendErr.Error())) {
+				// Wrap as a transport error to evaluate retryability (Req 19.2).
+				if !IsRetryable(ErrTransportFailed("send failed").WithCause(sendErr)) {
 					break
 				}
 				time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
@@ -421,9 +447,9 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 				errCh <- fmt.Errorf("failed to send on circuit %s: %w", cID, sendErr)
 				return
 			}
-			m.metrics.RecordThroughput(uint64(len(fullData)))
-			m.metrics.RecordCircuitThroughput(cID, uint64(len(fullData)))
-		}(shard.Data, circuitID, i)
+			m.metrics.RecordThroughput(uint64(len(packet)))
+			m.metrics.RecordCircuitThroughput(cID, uint64(len(packet)))
+		}(routingPacket, circ.ID, i)
 	}
 
 	wg.Wait()
@@ -442,21 +468,43 @@ func (m *Mixnet) ReceiveHandler() func(network.Stream) {
 	return m.handleIncomingStream
 }
 
-// handleIncomingStream handles incoming shard at destination (Req 9)
+// handleIncomingStream handles incoming shard at destination (Req 9, 16.2).
+//
+// The exit relay opens this stream and performs a Noise NN handshake with the
+// destination as initiator. The destination (this function) acts as the
+// responder, which mirrors what HandleStream does for relay-to-relay hops.
 func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	defer stream.Close()
 
-	// Read the shard data with timeout
 	stream.SetDeadline(time.Now().Add(m.destHandler.timeout))
 
-	buf := make([]byte, 64*1024)
-	n, err := stream.Read(buf)
+	// Noise NN handshake: destination is responder (Req 16.2).
+	// The exit relay is the initiator (matches forwardToPeerStream).
+	_, recvCS, err := noiseutil.PerformHandshake(stream, false)
 	if err != nil {
-		log.Printf("mixnet: handleIncomingStream: read error: %v", err)
+		log.Printf("mixnet: handleIncomingStream: noise handshake error: %v", err)
 		return
 	}
 
-	shardData := buf[:n]
+	// Read the Noise-framed shard packet.
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		log.Printf("mixnet: handleIncomingStream: read length error: %v", err)
+		return
+	}
+	msgLen := binary.BigEndian.Uint16(lenBuf)
+	encBuf := make([]byte, msgLen)
+	if _, err := io.ReadFull(stream, encBuf); err != nil {
+		log.Printf("mixnet: handleIncomingStream: read message error: %v", err)
+		return
+	}
+
+	// Noise-decrypt to get [shard_idx:4][shard_data].
+	shardData, err := recvCS.Decrypt(nil, nil, encBuf)
+	if err != nil {
+		log.Printf("mixnet: handleIncomingStream: decrypt error: %v", err)
+		return
+	}
 
 	// Parse shard header to get index
 	shard, err := m.parseShard(shardData)
@@ -545,10 +593,16 @@ func (m *Mixnet) sendCloseSignals() {
 				if handler, ok := m.circuitMgr.GetStream(circuitID); ok && handler != nil {
 					s := handler.Stream()
 					s.CloseWrite()
-					// Wait for relay to close its write end (ack signal, Req 18.2)
+					// Wait for relay to close its write end (ack signal, Req 18.2).
+					// Any response (EOF or timeout error) confirms delivery.
 					s.SetDeadline(time.Now().Add(10 * time.Second))
 					buf := make([]byte, 1)
-					s.Read(buf) // returns err when relay closes; that's the ack
+					_, ackErr := s.Read(buf)
+					// EOF means relay closed normally (expected ack).
+					// Any other non-nil error (deadline, reset) is logged for diagnostics.
+					if ackErr != nil && ackErr.Error() != "EOF" {
+						log.Printf("mixnet: close ack circuit %s: %v", circuitID, ackErr)
+					}
 				}
 			}(c.ID)
 		}
