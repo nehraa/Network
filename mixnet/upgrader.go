@@ -608,7 +608,6 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	if int64(len(shardData)) > maxInboundShardSize {
 		return
 	}
-
 	if len(shardData) < 1 {
 		return
 	}
