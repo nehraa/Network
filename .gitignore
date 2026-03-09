@@ -16,3 +16,4 @@ mixnet/benchmarks/*.md
 .github/
 .swarm/
 .mcp.json
+.worktrees
