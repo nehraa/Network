@@ -27,21 +27,27 @@ type RelayInfo struct {
 	Connected bool
 }
 
+// CircuitConfig controls how many circuits are built and how long stream setup
+// is allowed to take.
 type CircuitConfig struct {
 	HopCount      int
 	CircuitCount  int
 	StreamTimeout time.Duration
 }
 
+// StreamHandler tracks the active libp2p stream associated with a circuit.
 type StreamHandler struct {
 	stream network.Stream
 	peerID peer.ID
 }
 
+// Stream returns the underlying libp2p stream bound to the circuit.
 func (h *StreamHandler) Stream() network.Stream {
 	return h.stream
 }
 
+// CircuitManager builds circuits, binds streams to them, and coordinates
+// heartbeat-based failure handling.
 type CircuitManager struct {
 	cfg       *CircuitConfig
 	circuits  map[string]*Circuit
@@ -55,6 +61,8 @@ type CircuitManager struct {
 	cancel    context.CancelFunc
 }
 
+// NewCircuitManager creates a manager with sane defaults for recovery
+// thresholds and stream setup timeouts.
 func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 	threshold := cfg.CircuitCount - 1
 	if threshold < 1 {
@@ -78,12 +86,15 @@ func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 	}
 }
 
+// SetHost installs the libp2p host used for connection and stream operations.
 func (m *CircuitManager) SetHost(h host.Host) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.host = h
 }
 
+// BuildCircuits builds up to CircuitCount unique circuits from the supplied
+// relay candidates while excluding the destination and local host.
 func (m *CircuitManager) BuildCircuits(ctx context.Context, dest peer.ID, relays []RelayInfo) ([]*Circuit, error) {
 	if len(relays) < m.cfg.HopCount*m.cfg.CircuitCount {
 		return nil, fmt.Errorf("insufficient relays: have %d, need %d",
@@ -110,6 +121,8 @@ func (m *CircuitManager) BuildCircuits(ctx context.Context, dest peer.ID, relays
 	return circuits, nil
 }
 
+// BuildCircuit constructs a single circuit from the manager's current relay
+// pool.
 func (m *CircuitManager) BuildCircuit() (*Circuit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -131,6 +144,8 @@ func (m *CircuitManager) BuildCircuit() (*Circuit, error) {
 	return c, nil
 }
 
+// EstablishCircuit opens a libp2p stream to the circuit entry relay and binds
+// that stream to the circuit ID.
 func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protocolID string) error {
 	if len(circuit.Peers) == 0 {
 		return fmt.Errorf("circuit has no peers")
@@ -180,6 +195,7 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 	return nil
 }
 
+// SendData writes raw bytes onto the libp2p stream associated with circuitID.
 func (m *CircuitManager) SendData(circuitID string, data []byte) error {
 	m.mu.RLock()
 	handler, ok := m.streams[circuitID]
@@ -193,6 +209,7 @@ func (m *CircuitManager) SendData(circuitID string, data []byte) error {
 	return err
 }
 
+// ReadData reads raw bytes from the libp2p stream associated with circuitID.
 func (m *CircuitManager) ReadData(circuitID string, buf []byte) (int, error) {
 	m.mu.RLock()
 	handler, ok := m.streams[circuitID]
@@ -205,6 +222,8 @@ func (m *CircuitManager) ReadData(circuitID string, buf []byte) (int, error) {
 	return handler.stream.Read(buf)
 }
 
+// CloseCircuit closes the stream associated with circuitID and marks the
+// circuit closed.
 func (m *CircuitManager) CloseCircuit(circuitID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -222,6 +241,8 @@ func (m *CircuitManager) CloseCircuit(circuitID string) error {
 	return nil
 }
 
+// CloseCircuitWithContext closes the stream associated with circuitID while
+// honoring ctx for cancellation or timeout.
 func (m *CircuitManager) CloseCircuitWithContext(ctx context.Context, circuitID string) error {
 	m.mu.Lock()
 	handler, ok := m.streams[circuitID]
@@ -308,6 +329,7 @@ func (m *CircuitManager) buildUniqueCircuits(relays []RelayInfo) []*Circuit {
 	return circuits
 }
 
+// ActivateCircuit marks a successfully established circuit active.
 func (m *CircuitManager) ActivateCircuit(circuitID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -321,6 +343,8 @@ func (m *CircuitManager) ActivateCircuit(circuitID string) error {
 	return nil
 }
 
+// DetectFailure reports whether the circuit has failed explicitly or missed its
+// heartbeat deadline.
 func (m *CircuitManager) DetectFailure(circuitID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -347,6 +371,8 @@ func (m *CircuitManager) DetectFailure(circuitID string) bool {
 	return false
 }
 
+// StartHeartbeat begins periodically refreshing the circuit heartbeat timestamp
+// until the manager is closed.
 func (m *CircuitManager) StartHeartbeat(circuitID string, interval time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -377,6 +403,8 @@ func (m *CircuitManager) StartHeartbeat(circuitID string, interval time.Duration
 	}()
 }
 
+// ActiveCircuitCount returns the number of circuits currently in the active
+// state.
 func (m *CircuitManager) ActiveCircuitCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -390,10 +418,14 @@ func (m *CircuitManager) ActiveCircuitCount() int {
 	return count
 }
 
+// CanRecover reports whether enough active circuits remain to tolerate a
+// failure and continue operating.
 func (m *CircuitManager) CanRecover() bool {
 	return m.ActiveCircuitCount() >= m.threshold
 }
 
+// RecoveryCapacity returns how many additional circuit failures can be absorbed
+// before the manager drops below its recovery threshold.
 func (m *CircuitManager) RecoveryCapacity() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -411,6 +443,8 @@ func (m *CircuitManager) RecoveryCapacity() int {
 	return -1
 }
 
+// RebuildCircuit creates a replacement circuit for a failed path while trying
+// to avoid reusing the failed relays.
 func (m *CircuitManager) RebuildCircuit(failedID string) (*Circuit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -523,6 +557,8 @@ func (m *CircuitManager) RebuildCircuit(failedID string) (*Circuit, error) {
 	return circuit, nil
 }
 
+// Close stops background work, closes all tracked streams, and marks all
+// circuits closed.
 func (m *CircuitManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -543,6 +579,7 @@ func (m *CircuitManager) Close() error {
 	return nil
 }
 
+// GetCircuit returns the circuit registered under id, if present.
 func (m *CircuitManager) GetCircuit(id string) (*Circuit, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -551,6 +588,8 @@ func (m *CircuitManager) GetCircuit(id string) (*Circuit, bool) {
 	return c, ok
 }
 
+// ListCircuits returns a snapshot of all circuits currently tracked by the
+// manager.
 func (m *CircuitManager) ListCircuits() []*Circuit {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -562,6 +601,7 @@ func (m *CircuitManager) ListCircuits() []*Circuit {
 	return result
 }
 
+// MarkCircuitFailed transitions circuitID into the failed state if it exists.
 func (m *CircuitManager) MarkCircuitFailed(circuitID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -571,6 +611,8 @@ func (m *CircuitManager) MarkCircuitFailed(circuitID string) {
 	}
 }
 
+// UpdateRelayPool replaces the manager's relay pool with the supplied relay
+// candidates.
 func (m *CircuitManager) UpdateRelayPool(relays []RelayInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -581,6 +623,7 @@ func (m *CircuitManager) UpdateRelayPool(relays []RelayInfo) {
 	}
 }
 
+// GetRelaysForCircuit returns the ordered relay IDs used by circuitID.
 func (m *CircuitManager) GetRelaysForCircuit(circuitID string) ([]peer.ID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -593,10 +636,12 @@ func (m *CircuitManager) GetRelaysForCircuit(circuitID string) ([]peer.ID, error
 	return circuit.Peers, nil
 }
 
+// Config returns the manager configuration.
 func (m *CircuitManager) Config() *CircuitConfig {
 	return m.cfg
 }
 
+// GetStream returns the stream handler registered for circuitID, if present.
 func (m *CircuitManager) GetStream(circuitID string) (*StreamHandler, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

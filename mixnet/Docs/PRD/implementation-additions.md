@@ -38,7 +38,7 @@ This document describes features and design decisions present in the Go implemen
 ```go
 type MixnetConfig struct {
     HeaderPaddingEnabled bool
-    HeaderPaddingMin     int  // default: 0
+    HeaderPaddingMin     int  // default: 16
     HeaderPaddingMax     int  // default: 256
 }
 ```
