@@ -430,7 +430,9 @@ func (m *MixnetWithResources) CloseWithResources() error {
 	m.resourceMgr.Stop()
 
 	// Erase keys
-	m.pipeline.Encrypter().SecureErase()
+	if m.pipeline != nil {
+		m.pipeline.Encrypter().SecureErase()
+	}
 
 	// Close circuits
 	return m.CircuitManager().Close()

@@ -28,7 +28,7 @@ func (m *Mixnet) OpenStream(ctx context.Context, dest peer.ID) (*MixStream, erro
 	if _, err := m.EstablishConnection(ctx, dest); err != nil {
 		return nil, err
 	}
-	sessionID := fmt.Sprintf("%s-%d", dest.String(), time.Now().UnixNano())
+	sessionID := normalizeSessionID(fmt.Sprintf("%s-%d", dest.String(), time.Now().UnixNano()))
 	ch := m.destHandler.registerSession(sessionID)
 	return &MixStream{
 		mixnet:    m,
@@ -53,7 +53,19 @@ func (s *MixStream) Read(p []byte) (int, error) {
 	}
 	s.mu.Unlock()
 
-	data, ok := <-s.ch
+	var (
+		data []byte
+		ok   bool
+	)
+	if s.ctx != nil {
+		select {
+		case <-s.ctx.Done():
+			return 0, s.ctx.Err()
+		case data, ok = <-s.ch:
+		}
+	} else {
+		data, ok = <-s.ch
+	}
 	if !ok {
 		return 0, io.EOF
 	}
@@ -113,6 +125,7 @@ func (m *Mixnet) AcceptStream(ctx context.Context) (*MixStream, error) {
 			mixnet:    m,
 			dest:      "",
 			sessionID: sessionID,
+			ctx:       ctx,
 			ch:        ch,
 		}, nil
 	}

@@ -69,12 +69,12 @@ func NewCircuitManager(cfg *CircuitConfig) *CircuitManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &CircuitManager{
-		cfg:        cfg,
-		circuits:   make(map[string]*Circuit),
-		threshold:  threshold,
-		streams:    make(map[string]*StreamHandler),
-		ctx:        ctx,
-		cancel:     cancel,
+		cfg:       cfg,
+		circuits:  make(map[string]*Circuit),
+		threshold: threshold,
+		streams:   make(map[string]*StreamHandler),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 }
 
@@ -157,11 +157,12 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 	}
 
 	if len(addrs) > 0 {
-		err := h.Connect(connectCtx, peer.AddrInfo{
+		if err := h.Connect(connectCtx, peer.AddrInfo{
 			ID:    entryPeer,
 			Addrs: addrs,
-		})
-		_ = err
+		}); err != nil {
+			return fmt.Errorf("failed to connect to %s: %w", entryPeer, err)
+		}
 	}
 
 	stream, err := h.NewStream(connectCtx, entryPeer, protocol.ID(protocolID))
@@ -334,11 +335,12 @@ func (m *CircuitManager) DetectFailure(circuitID string) bool {
 		return true
 	}
 
-	if circuit.LastHeartbeat.IsZero() {
+	lastHeartbeat := circuit.GetLastHeartbeat()
+	if lastHeartbeat.IsZero() {
 		return false
 	}
 	heartbeatTimeout := 30 * time.Second
-	if time.Since(circuit.LastHeartbeat) > heartbeatTimeout {
+	if time.Since(lastHeartbeat) > heartbeatTimeout {
 		return true
 	}
 
@@ -354,7 +356,7 @@ func (m *CircuitManager) StartHeartbeat(circuitID string, interval time.Duration
 		return
 	}
 
-	circuit.LastHeartbeat = time.Now()
+	circuit.SetLastHeartbeat(time.Now())
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -367,7 +369,7 @@ func (m *CircuitManager) StartHeartbeat(circuitID string, interval time.Duration
 			case <-ticker.C:
 				m.mu.Lock()
 				if c, exists := m.circuits[circuitID]; exists {
-					c.LastHeartbeat = time.Now()
+					c.SetLastHeartbeat(time.Now())
 				}
 				m.mu.Unlock()
 			}

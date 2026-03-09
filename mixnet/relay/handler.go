@@ -98,7 +98,7 @@ func NewHandler(host host.Host, maxCircuits int, maxBandwidth int64) *Handler {
 // AC 7.1: Decrypt outermost layer
 // AC 7.2: Extract next-hop from decrypted header
 func (h *Handler) HandleStream(stream network.Stream) {
-	ctx := context.Background()
+	baseCtx := context.Background()
 	defer stream.Close()
 
 	// Enforce compatibility circuit limits only when rcmgr integration is disabled.
@@ -128,9 +128,6 @@ func (h *Handler) HandleStream(stream network.Stream) {
 		h.mu.Unlock()
 	}()
 
-	// Set a read deadline so the relay cannot be held open indefinitely (Req 6.3).
-	stream.SetDeadline(time.Now().Add(ReadTimeout))
-
 	reader := bufio.NewReader(stream)
 	var dst network.Stream
 	var dstPeer peer.ID
@@ -143,11 +140,17 @@ func (h *Handler) HandleStream(stream network.Stream) {
 	}()
 
 	for {
+		// Set a read deadline so the relay cannot be held open indefinitely (Req 6.3).
+		deadline := time.Now().Add(ReadTimeout)
+		_ = stream.SetDeadline(deadline)
+
 		circuitID, frameVersion, encPayload, releaseMem, err := readEncryptedFrame(reader, stream.Scope())
 		if err != nil {
 			return
 		}
-		err = func() error {
+		frameCtx, cancel := context.WithDeadline(baseCtx, deadline)
+		err = func(ctx context.Context) error {
+			defer cancel()
 			if releaseMem != nil {
 				defer releaseMem()
 			}
@@ -278,7 +281,15 @@ func (h *Handler) HandleStream(stream network.Stream) {
 						return err
 					}
 					_ = dst.Close()
+					dst = nil
 					return io.EOF
+				}
+				// The destination handler treats each final-delivery stream as a
+				// single message and reads until EOF, so normal data delivery must
+				// close the final-hop stream after each payload.
+				if dst != nil {
+					_ = dst.Close()
+					dst = nil
 				}
 			} else {
 				forwardPayload := innerHeader
@@ -297,7 +308,7 @@ func (h *Handler) HandleStream(stream network.Stream) {
 			}
 
 			return nil
-		}()
+		}(frameCtx)
 		if err == io.EOF {
 			return
 		}
@@ -534,6 +545,7 @@ func (h *Handler) HandleKeyExchange(stream network.Stream) {
 		return
 	}
 	h.setCircuitKey(circuitID, key)
+	_ = writeFrame(stream, []byte{0x01})
 }
 
 func (h *Handler) setCircuitKey(circuitID string, key []byte) {

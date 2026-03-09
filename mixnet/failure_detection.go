@@ -214,7 +214,8 @@ func (n *CircuitFailureNotifier) scanCircuits() {
 			// Connectedness checks can be noisy for short-lived circuits; rely on heartbeat instead.
 			entry := c.Peers[0]
 
-			if !c.LastHeartbeat.IsZero() && time.Since(c.LastHeartbeat) > failureDetectionDeadline {
+			lastHeartbeat := c.GetLastHeartbeat()
+			if !lastHeartbeat.IsZero() && time.Since(lastHeartbeat) > failureDetectionDeadline {
 				n.enqueueFailure(c.ID, entry, "")
 			}
 		}

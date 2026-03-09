@@ -3,7 +3,11 @@ package mixnet
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -54,7 +58,7 @@ type Mixnet struct {
 	activeConnections map[peer.ID][]*circuit.Circuit
 	pendingShards     map[peer.ID]*PendingTransmission
 
-	mu      sync.RWMutex
+	mu     sync.RWMutex
 	closed atomic.Bool
 }
 
@@ -70,15 +74,20 @@ type PendingTransmission struct {
 type DestinationHandler struct {
 	pipeline    *ces.CESPipeline
 	shardBuf    map[string][]*ces.Shard
+	shardTags   map[string]map[int][]byte
 	totalShards map[string]int
 	timers      map[string]*time.Timer
 	sessions    map[string]chan []byte
 	keys        map[string]sessionKey
+	keyData     map[string][]byte
 	inboundCh   chan string
 	threshold   int
 	timeout     time.Duration
 	dataCh      chan []byte
 	stopCh      chan struct{}
+	useLengthPrefix bool
+	authEnabled     bool
+	authTagSize     int
 	mu          sync.Mutex
 }
 
@@ -87,6 +96,11 @@ const (
 	msgTypeCloseReq byte = 0x01
 	msgTypeCloseAck byte = 0x02
 )
+
+// maxInboundShardSize is the upper bound on the number of bytes read from a single
+// inbound stream at the destination. This prevents a malicious peer from forcing
+// unbounded memory allocation before the stream deadline fires.
+const maxInboundShardSize int64 = relay.MaxPayloadSize * 4 // 256 KiB
 
 // NewMixnet creates a new Mixnet instance with the provided configuration, host, and routing.
 func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, error) {
@@ -119,7 +133,10 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 		Compression:      cfg.Compression,
 		ErasureThreshold: cfg.GetErasureThreshold(),
 	}
-	pipeline := ces.NewPipeline(pipelineCfg)
+	var pipeline *ces.CESPipeline
+	if cfg.UseCESPipeline {
+		pipeline = ces.NewPipeline(pipelineCfg)
+	}
 
 	// Create relay handler (Req 7)
 	relayHandler := relay.NewHandler(h, cfg.CircuitCount*cfg.HopCount, 1024*1024)
@@ -160,15 +177,20 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 		destHandler: &DestinationHandler{
 			pipeline:    pipeline,
 			shardBuf:    make(map[string][]*ces.Shard),
+			shardTags:   make(map[string]map[int][]byte),
 			totalShards: make(map[string]int),
 			timers:      make(map[string]*time.Timer),
 			sessions:    make(map[string]chan []byte),
 			keys:        make(map[string]sessionKey),
+			keyData:     make(map[string][]byte),
 			inboundCh:   make(chan string, 100),
 			threshold:   cfg.GetErasureThreshold(),
 			timeout:     30 * time.Second,
 			dataCh:      make(chan []byte, 100),
 			stopCh:      make(chan struct{}),
+			useLengthPrefix: cfg.PayloadPaddingStrategy != PaddingStrategyNone,
+			authEnabled:     cfg.EnableAuthTag,
+			authTagSize:     cfg.AuthTagSize,
 		},
 	}
 
@@ -334,6 +356,10 @@ func (m *Mixnet) EstablishConnection(ctx context.Context, dest peer.ID) ([]*circ
 }
 
 func (m *Mixnet) discoverRelays(ctx context.Context, dest peer.ID) ([]circuit.RelayInfo, error) {
+	if m.routing == nil {
+		return nil, ErrDiscoveryFailed("routing not configured")
+	}
+
 	// Advertise ourselves as a relay first (Req 7)
 	// In a real implementation, this would be a background task
 
@@ -413,6 +439,7 @@ func (m *Mixnet) Send(ctx context.Context, dest peer.ID, data []byte) error {
 
 // SendWithSession sends data using a caller-provided session ID (used by MixnetStream).
 func (m *Mixnet) SendWithSession(ctx context.Context, dest peer.ID, data []byte, sessionID string) error {
+	sessionID = normalizeSessionID(sessionID)
 	m.mu.RLock()
 	circuits := m.activeConnections[dest]
 	m.mu.RUnlock()
@@ -424,28 +451,68 @@ func (m *Mixnet) SendWithSession(ctx context.Context, dest peer.ID, data []byte,
 		}
 	}
 
-	// Record original size for compression metrics
-	originalSize := len(data)
+	var (
+		keyData []byte
+		shards  []*ces.Shard
+	)
+	if m.config.UseCESPipeline {
+		// Record original size for compression metrics
+		originalSize := len(data)
 
-	// Process through CES pipeline: compress first.
-	compressed, err := m.pipeline.Compressor().Compress(data)
-	if err != nil {
-		return ErrCompressionFailed("compression failed").WithCause(err)
+		// Process through CES pipeline: compress first.
+		compressed, err := m.pipeline.Compressor().Compress(data)
+		if err != nil {
+			return ErrCompressionFailed("compression failed").WithCause(err)
+		}
+
+		payload := compressed
+		useLengthPrefix := m.config.PayloadPaddingStrategy != PaddingStrategyNone
+		if useLengthPrefix {
+			origLen := len(payload)
+			padded, _, err := applyPayloadPadding(payload, m.config)
+			if err != nil {
+				return ErrCompressionFailed("padding failed").WithCause(err)
+			}
+			payload = addLengthPrefixWithLen(padded, origLen)
+		}
+
+		// Encrypt before sharding (Req 3.3).
+		encryptedPayload, keyDataOut, err := encryptSessionPayload(payload)
+		if err != nil {
+			return ErrEncryptionFailed("session encryption failed").WithCause(err)
+		}
+
+		shardsOut, err := m.pipeline.Sharder().Shard(encryptedPayload)
+		if err != nil {
+			return ErrShardingFailed("sharding failed").WithCause(err)
+		}
+
+		// Record compression ratio
+		m.metrics.RecordCompressionRatio(originalSize, len(compressed))
+		keyData = keyDataOut
+		shards = shardsOut
+	} else {
+		payload := data
+		useLengthPrefix := m.config.PayloadPaddingStrategy != PaddingStrategyNone
+		if useLengthPrefix {
+			origLen := len(payload)
+			padded, _, err := applyPayloadPadding(payload, m.config)
+			if err != nil {
+				return ErrCompressionFailed("padding failed").WithCause(err)
+			}
+			payload = addLengthPrefixWithLen(padded, origLen)
+		}
+		encryptedPayload, keyDataOut, err := encryptSessionPayload(payload)
+		if err != nil {
+			return ErrEncryptionFailed("session encryption failed").WithCause(err)
+		}
+		shardsOut, err := shardEvenly(encryptedPayload, len(circuits))
+		if err != nil {
+			return ErrShardingFailed("sharding failed").WithCause(err)
+		}
+		keyData = keyDataOut
+		shards = shardsOut
 	}
-
-	// Encrypt before sharding (Req 3.3).
-	encryptedPayload, keyData, err := encryptSessionPayload(compressed)
-	if err != nil {
-		return ErrEncryptionFailed("session encryption failed").WithCause(err)
-	}
-
-	shards, err := m.pipeline.Sharder().Shard(encryptedPayload)
-	if err != nil {
-		return ErrShardingFailed("sharding failed").WithCause(err)
-	}
-
-	// Record compression ratio
-	m.metrics.RecordCompressionRatio(originalSize, len(data))
 
 	sessionIDBytes := []byte(sessionID)
 
@@ -454,16 +521,69 @@ func (m *Mixnet) SendWithSession(ctx context.Context, dest peer.ID, data []byte,
 		return ErrEncryptionFailed("failed to establish hop keys").WithCause(err)
 	}
 
+	var authKey *sessionKey
+	if m.config.EnableAuthTag {
+		decoded, err := decodeSessionKeyData(keyData)
+		if err != nil {
+			return ErrEncryptionFailed("auth key decode failed").WithCause(err)
+		}
+		authKey = &decoded
+	}
+
 	// Enforce 1:1 shard-to-circuit mapping (Req 2.4, 8.1).
 	if len(shards) != len(circuits) {
 		return ErrShardingFailed(fmt.Sprintf("shard count mismatch: have %d shards, %d circuits", len(shards), len(circuits)))
 	}
 	m.setPendingTransmission(dest, sessionID, keyData, shards)
-	if err := m.sendShardsAcrossCircuits(ctx, dest, sessionIDBytes, keyData, shards, circuits); err != nil {
+	if err := m.sendShardsAcrossCircuits(ctx, dest, sessionIDBytes, keyData, shards, circuits, authKey); err != nil {
 		return err
 	}
 	m.clearPendingTransmission(dest, sessionID)
 	return nil
+}
+
+func normalizeSessionID(sessionID string) string {
+	if len(sessionID) <= 64 {
+		return sessionID
+	}
+	sum := sha256.Sum256([]byte(sessionID))
+	return hex.EncodeToString(sum[:])
+}
+
+func (m *Mixnet) headerPaddingConfig() *PrivacyPaddingConfig {
+	if m == nil || m.config == nil || !m.config.HeaderPaddingEnabled {
+		return nil
+	}
+	return &PrivacyPaddingConfig{
+		Enabled:  true,
+		MinBytes: m.config.HeaderPaddingMin,
+		MaxBytes: m.config.HeaderPaddingMax,
+	}
+}
+
+func shardEvenly(data []byte, total int) ([]*ces.Shard, error) {
+	if total <= 0 {
+		return nil, fmt.Errorf("invalid shard count: %d", total)
+	}
+	parts := make([]*ces.Shard, total)
+	base := len(data) / total
+	remainder := len(data) % total
+	offset := 0
+	for i := 0; i < total; i++ {
+		size := base
+		if i < remainder {
+			size++
+		}
+		end := offset + size
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := make([]byte, end-offset)
+		copy(chunk, data[offset:end])
+		parts[i] = &ces.Shard{Index: i, Data: chunk}
+		offset = end
+	}
+	return parts, nil
 }
 
 // ReceiveHandler returns the function used to handle incoming Mixnet streams.
@@ -475,16 +595,19 @@ func (m *Mixnet) ReceiveHandler() func(network.Stream) {
 func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	defer stream.Close()
 
-	// Read the shard data with timeout
+	// Read the shard data with timeout, bounded to maxInboundShardSize to
+	// prevent a peer from causing unbounded memory allocation.
 	stream.SetDeadline(time.Now().Add(m.destHandler.timeout))
 
-	buf := make([]byte, 64*1024)
-	n, err := stream.Read(buf)
-	if err != nil {
+	shardData, err := io.ReadAll(io.LimitReader(stream, maxInboundShardSize+1))
+	if err != nil || len(shardData) == 0 {
 		return
 	}
 
-	shardData := buf[:n]
+	// Reject frames that hit or exceed the size cap.
+	if int64(len(shardData)) > maxInboundShardSize {
+		return
+	}
 
 	if len(shardData) < 1 {
 		return
@@ -500,7 +623,7 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	}
 
 	// Parse data payload (msgType already stripped by relay).
-	sessionID, shard, keyData, totalShards, err := m.parseShardPayload(shardData[1:])
+	sessionID, shard, keyData, authTag, totalShards, err := m.parseShardPayload(shardData[1:])
 	if err != nil {
 		return
 	}
@@ -509,7 +632,7 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	m.destHandler.ensureSession(sessionID)
 
 	// Add to buffer with correct session ID (not hardcoded "default")
-	m.destHandler.AddShard(sessionID, shard, keyData, totalShards)
+	m.destHandler.AddShard(sessionID, shard, keyData, authTag, totalShards)
 
 	// Check if we can reconstruct using the correct session ID
 	data, err := m.destHandler.TryReconstruct(sessionID)
@@ -526,17 +649,17 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 }
 
 // parseShardPayload parses shard data including session ID.
-func (m *Mixnet) parseShardPayload(data []byte) (string, *ces.Shard, []byte, int, error) {
+func (m *Mixnet) parseShardPayload(data []byte) (string, *ces.Shard, []byte, []byte, int, error) {
 	header, payload, err := DecodePrivacyShard(data)
 	if err != nil {
-		return "", nil, nil, 0, err
+		return "", nil, nil, nil, 0, err
 	}
 	sessionID := string(header.SessionID)
 	idx := int(header.ShardIndex)
 	return sessionID, &ces.Shard{
 		Index: idx,
 		Data:  payload,
-	}, header.KeyData, int(header.TotalShards), nil
+	}, header.KeyData, header.AuthTag, int(header.TotalShards), nil
 }
 
 // parseShard parses shard data from the stream.
@@ -553,7 +676,7 @@ func (m *Mixnet) parseShard(data []byte) (*ces.Shard, error) {
 }
 
 // AddShard adds an incoming shard to the destination's buffer for the given session.
-func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard, keyData []byte, totalShards int) {
+func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard, keyData []byte, authTag []byte, totalShards int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if totalShards > 0 {
@@ -564,19 +687,28 @@ func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard, keyDat
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			delete(h.shardBuf, sessionID)
+			delete(h.shardTags, sessionID)
 			delete(h.totalShards, sessionID)
+			delete(h.keyData, sessionID)
 			if t, ok := h.timers[sessionID]; ok {
 				t.Stop()
 				delete(h.timers, sessionID)
 			}
 			delete(h.keys, sessionID)
-			delete(h.sessions, sessionID)
+			h.closeSessionLocked(sessionID)
 		})
 	}
 	if len(keyData) > 0 {
+		h.keyData[sessionID] = append([]byte(nil), keyData...)
 		if key, err := decodeSessionKeyData(keyData); err == nil {
 			h.keys[sessionID] = key
 		}
+	}
+	if h.authEnabled && shard != nil && authTag != nil {
+		if h.shardTags[sessionID] == nil {
+			h.shardTags[sessionID] = make(map[int][]byte)
+		}
+		h.shardTags[sessionID][shard.Index] = append([]byte(nil), authTag...)
 	}
 	h.shardBuf[sessionID] = append(h.shardBuf[sessionID], shard)
 }
@@ -587,42 +719,88 @@ func (h *DestinationHandler) TryReconstruct(sessionID string) ([]byte, error) {
 	defer h.mu.Unlock()
 
 	shards := h.shardBuf[sessionID]
-	total := h.totalShards[sessionID]
-	if total <= 0 {
-		total = h.pipeline.Sharder().TotalShards()
-	}
 	unique := dedupeShards(shards)
-	missing := missingShardIDs(unique, total)
 
-	if len(unique) < h.threshold {
-		return nil, ErrReconstructionMissingShards(sessionID, len(unique), h.threshold, missing)
-	}
-
-	encrypted, err := h.pipeline.Sharder().Reconstruct(unique)
-	if err != nil {
-		return nil, ErrShardingFailed(fmt.Sprintf("reconstruction failed for session %s missing_shard_ids=%v", sessionID, missing)).WithCause(err)
-	}
 	key, ok := h.keys[sessionID]
 	if !ok {
-		missingKey := false
-		for _, id := range missing {
-			if id == 0 {
-				missingKey = true
+		missingKey := true
+		for _, sh := range unique {
+			if sh.Index == 0 {
+				missingKey = false
 				break
 			}
 		}
 		if missingKey {
-			return nil, ErrReconstructionMissingShards(sessionID, len(unique), h.threshold, missing)
+			return nil, ErrReconstructionMissingShards(sessionID, len(unique), h.threshold, []int{0})
 		}
 		return nil, ErrEncryptionFailed(fmt.Sprintf("missing session key for %s", sessionID))
 	}
-	decrypted, err := decryptSessionPayload(encrypted, key)
-	if err != nil {
-		return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+
+	var (
+		decrypted []byte
+		err       error
+	)
+	if h.pipeline == nil {
+		// CES disabled: require all shards and concatenate in index order.
+		total := h.totalShards[sessionID]
+		if total <= 0 {
+			total = len(unique)
+		}
+		missing := missingShardIDs(unique, total)
+		if len(unique) < total {
+			return nil, ErrReconstructionMissingShards(sessionID, len(unique), total, missing)
+		}
+		if h.authEnabled {
+			if err := h.verifyAuthTags(sessionID, unique, total, key); err != nil {
+				return nil, err
+			}
+		}
+		sorted := append([]*ces.Shard(nil), unique...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Index < sorted[j].Index })
+		combined := make([]byte, 0)
+		for _, sh := range sorted {
+			combined = append(combined, sh.Data...)
+		}
+		decrypted, err = decryptSessionPayload(combined, key)
+		if err != nil {
+			return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+		}
+	} else {
+		total := h.totalShards[sessionID]
+		if total <= 0 {
+			total = h.pipeline.Sharder().TotalShards()
+		}
+		missing := missingShardIDs(unique, total)
+		if len(unique) < h.threshold {
+			return nil, ErrReconstructionMissingShards(sessionID, len(unique), h.threshold, missing)
+		}
+		if h.authEnabled {
+			if err := h.verifyAuthTags(sessionID, unique, total, key); err != nil {
+				return nil, err
+			}
+		}
+		encrypted, err := h.pipeline.Sharder().Reconstruct(unique)
+		if err != nil {
+			return nil, ErrShardingFailed(fmt.Sprintf("reconstruction failed for session %s missing_shard_ids=%v", sessionID, missing)).WithCause(err)
+		}
+		decrypted, err = decryptSessionPayload(encrypted, key)
+		if err != nil {
+			return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+		}
 	}
-	data, err := h.pipeline.Compressor().Decompress(decrypted)
-	if err != nil {
-		return nil, err
+
+	data := decrypted
+	if h.useLengthPrefix {
+		data, err = stripLengthPrefix(data)
+		if err != nil {
+			return nil, ErrProtocolError("invalid length prefix").WithCause(err)
+		}
+	}
+	if h.pipeline != nil {
+		data, err = h.pipeline.Compressor().Decompress(data)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if t, ok := h.timers[sessionID]; ok {
@@ -630,9 +808,46 @@ func (h *DestinationHandler) TryReconstruct(sessionID string) ([]byte, error) {
 		delete(h.timers, sessionID)
 	}
 	delete(h.shardBuf, sessionID)
+	delete(h.shardTags, sessionID)
 	delete(h.keys, sessionID)
+	delete(h.keyData, sessionID)
 	delete(h.totalShards, sessionID)
 	return data, nil
+}
+
+func (h *DestinationHandler) verifyAuthTags(sessionID string, shards []*ces.Shard, total int, key sessionKey) error {
+	tags := h.shardTags[sessionID]
+	if tags == nil {
+		return ErrEncryptionFailed(fmt.Sprintf("missing auth tags for %s", sessionID))
+	}
+	keyPayload := h.keyData[sessionID]
+	for _, sh := range shards {
+		tag, ok := tags[sh.Index]
+		if !ok {
+			return ErrEncryptionFailed(fmt.Sprintf("missing auth tag for shard %d", sh.Index))
+		}
+		includeKeys := sh.Index == 0 && len(keyPayload) > 0
+		var payload []byte
+		if includeKeys {
+			payload = keyPayload
+		}
+		expected := computeAuthTag(key, []byte(sessionID), uint32(sh.Index), uint32(total), sh.Data, includeKeys, payload, h.authTagSize)
+		if !hmacEqual(tag, expected) {
+			return ErrEncryptionFailed(fmt.Sprintf("auth tag mismatch for shard %d", sh.Index))
+		}
+	}
+	return nil
+}
+
+func hmacEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
 }
 
 func (h *DestinationHandler) registerSession(sessionID string) chan []byte {
@@ -662,23 +877,31 @@ func (h *DestinationHandler) ensureSession(sessionID string) {
 func (h *DestinationHandler) unregisterSession(sessionID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if ch, ok := h.sessions[sessionID]; ok {
-		close(ch)
-		delete(h.sessions, sessionID)
-	}
+	h.closeSessionLocked(sessionID)
 }
 
 func (h *DestinationHandler) deliverSessionData(sessionID string, data []byte) {
 	h.mu.Lock()
 	ch, ok := h.sessions[sessionID]
-	h.mu.Unlock()
 	if !ok {
+		h.mu.Unlock()
 		return
 	}
+	// Keep lock held during non-blocking send so the channel cannot be closed concurrently.
 	select {
 	case ch <- data:
 	default:
 	}
+	h.mu.Unlock()
+}
+
+func (h *DestinationHandler) closeSessionLocked(sessionID string) {
+	ch, ok := h.sessions[sessionID]
+	if !ok {
+		return
+	}
+	close(ch)
+	delete(h.sessions, sessionID)
 }
 
 // DataChan returns a channel that receives reconstructed data.
@@ -730,9 +953,8 @@ func (m *Mixnet) Close() error {
 		for sessionID := range m.destHandler.keys {
 			delete(m.destHandler.keys, sessionID)
 		}
-		for sessionID, ch := range m.destHandler.sessions {
-			close(ch)
-			delete(m.destHandler.sessions, sessionID)
+		for sessionID := range m.destHandler.sessions {
+			m.destHandler.closeSessionLocked(sessionID)
 		}
 		m.destHandler.mu.Unlock()
 	}
@@ -759,6 +981,7 @@ func (m *Mixnet) Close() error {
 
 	// Close all circuits and collect errors
 	var closeErrors []error
+	var closeErrMu sync.Mutex
 	var wg sync.WaitGroup
 
 	for _, circuitID := range closeSignals {
@@ -766,11 +989,17 @@ func (m *Mixnet) Close() error {
 		go func(id string) {
 			defer wg.Done()
 			if err := m.sendCloseAndWait(ctx, id); err != nil {
-				closeErrors = append(closeErrors, ErrProtocolError(fmt.Sprintf("close ack failed for circuit %s", id)).WithCause(err))
+				// Close acknowledgements are best-effort. We log timeouts/failures
+				// but still proceed with shutdown so Close() remains reliable.
+				log.Printf("[mixnet] close ack failed for circuit %s: %v", id, err)
 			}
 			// Close the circuit and wait for completion
-			if err := m.circuitMgr.CloseCircuitWithContext(ctx, id); err != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer closeCancel()
+			if err := m.circuitMgr.CloseCircuitWithContext(closeCtx, id); err != nil {
+				closeErrMu.Lock()
 				closeErrors = append(closeErrors, ErrCircuitFailed(fmt.Sprintf("failed to close circuit %s", id)).WithCause(err))
+				closeErrMu.Unlock()
 			}
 		}(circuitID)
 	}
@@ -780,14 +1009,16 @@ func (m *Mixnet) Close() error {
 	// Check for context timeout (Req 18.5)
 	if ctx.Err() == context.DeadlineExceeded {
 		// Log timeout but don't fail - circuits will be cleaned up eventually
-		fmt.Printf("Warning: close acknowledgment timeout after %v\n", ackTimeout)
+		log.Printf("[mixnet] close acknowledgment timeout after %v", ackTimeout)
 	}
 
 	// Close underlying circuit manager
 	err := m.circuitMgr.Close()
 
 	// Securely erase all cryptographic material (Req 18.4)
-	m.pipeline.Encrypter().SecureErase()
+	if m.pipeline != nil {
+		m.pipeline.Encrypter().SecureErase()
+	}
 	m.clearCircuitKeys()
 
 	// Mark metrics
@@ -796,7 +1027,10 @@ func (m *Mixnet) Close() error {
 	}
 
 	if err != nil {
-		return ErrCircuitFailed("failed to close circuit manager").WithCause(err)
+		closeErrors = append(closeErrors, ErrCircuitFailed("failed to close circuit manager").WithCause(err))
+	}
+	if len(closeErrors) > 0 {
+		return ErrCircuitFailed(fmt.Sprintf("failed to close mixnet cleanly (%d errors)", len(closeErrors))).WithCause(errors.Join(closeErrors...))
 	}
 	return nil
 }
@@ -1031,6 +1265,12 @@ func (m *Mixnet) RecoverFromFailure(ctx context.Context, dest peer.ID) error {
 			if err != nil {
 				continue
 			}
+			keys, err := m.establishCircuitKeys(ctx, newCircuit)
+			if err != nil {
+				_ = m.circuitMgr.CloseCircuit(newCircuit.ID)
+				continue
+			}
+			m.setCircuitKeys(m.circuitKeyID(newCircuit), keys)
 
 			m.circuitMgr.ActivateCircuit(newCircuit.ID)
 			circuits[i] = newCircuit
@@ -1170,18 +1410,27 @@ func (m *Mixnet) reschedulePendingShards(ctx context.Context, dest peer.ID) erro
 	if len(pt.Shards) != len(circuits) {
 		return ErrShardingFailed(fmt.Sprintf("cannot reschedule shards: shards=%d active_circuits=%d", len(pt.Shards), len(circuits)))
 	}
-	if err := m.sendShardsAcrossCircuits(ctx, dest, []byte(pt.SessionID), pt.KeyData, pt.Shards, circuits); err != nil {
+	var authKey *sessionKey
+	if m.config.EnableAuthTag {
+		decoded, err := decodeSessionKeyData(pt.KeyData)
+		if err != nil {
+			return ErrEncryptionFailed("auth key decode failed").WithCause(err)
+		}
+		authKey = &decoded
+	}
+	if err := m.sendShardsAcrossCircuits(ctx, dest, []byte(pt.SessionID), pt.KeyData, pt.Shards, circuits, authKey); err != nil {
 		return err
 	}
 	m.clearPendingTransmission(dest, pt.SessionID)
 	return nil
 }
 
-func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, sessionIDBytes []byte, keyData []byte, shards []*ces.Shard, circuits []*circuit.Circuit) error {
+func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, sessionIDBytes []byte, keyData []byte, shards []*ces.Shard, circuits []*circuit.Circuit, authKey *sessionKey) error {
 	_ = ctx
 	sendCount := len(shards)
 	var wg sync.WaitGroup
 	errCh := make(chan error, sendCount)
+	paddingCfg := m.headerPaddingConfig()
 
 	for i := 0; i < sendCount; i++ {
 		// Apply jitter for all shards after the first to break timing correlations.
@@ -1213,13 +1462,18 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 			if includeKeys {
 				keyPayload = keyData
 			}
+			var authTag []byte
+			if m.config.EnableAuthTag && authKey != nil {
+				authTag = computeAuthTag(*authKey, sessionIDBytes, uint32(shardIndex), uint32(sendCount), shardData, includeKeys, keyPayload, m.config.AuthTagSize)
+			}
 			privacyShard, err := EncodePrivacyShard(shardData, PrivacyShardHeader{
 				SessionID:   sessionIDBytes,
 				ShardIndex:  uint32(shardIndex),
 				TotalShards: uint32(sendCount),
 				HasKeys:     includeKeys,
 				KeyData:     keyPayload,
-			})
+				AuthTag:     authTag,
+			}, paddingCfg)
 			if err != nil {
 				errCh <- ErrProtocolError("failed to encode privacy shard").WithCause(err)
 				return
@@ -1240,7 +1494,8 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 					TotalShards: uint32(sendCount),
 					HasKeys:     includeKeys,
 					KeyData:     keyPayload,
-				})
+					AuthTag:     authTag,
+				}, paddingCfg)
 				if err != nil {
 					errCh <- ErrProtocolError("failed to encode control header").WithCause(err)
 					return

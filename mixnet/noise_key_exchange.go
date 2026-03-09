@@ -93,6 +93,14 @@ func runNoiseXXInitiator(ctx context.Context, stream network.Stream, payload []b
 		return fmt.Errorf("missing cipher state after handshake")
 	}
 
+	ack, err := readFrame(stream)
+	if err != nil {
+		return fmt.Errorf("key exchange ack read: %w", err)
+	}
+	if len(ack) != 1 || ack[0] != 0x01 {
+		return fmt.Errorf("invalid key exchange ack")
+	}
+
 	return nil
 }
 

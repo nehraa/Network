@@ -1,8 +1,10 @@
-# Design Document: Lib-Mix Protocol
+# Design Document: Lib-Mix Protocol (Implementation-Aligned)
 
 ## Overview
 
 Lib-Mix is a high-performance metadata-private communication protocol for libp2p that combines configurable onion routing with multi-path sharding to achieve near-wire speeds while preserving anonymity. The protocol operates as a transparent stream upgrader, allowing developers to add metadata privacy to existing libp2p applications with minimal code changes.
+
+**Implementation Status**: This document reflects the actual Go implementation in `go-libp2p-mixnet-impl`.
 
 ### Core Design Principles
 
@@ -10,33 +12,44 @@ Lib-Mix is a high-performance metadata-private communication protocol for libp2p
 2. **Configurable Privacy-Performance Trade-off**: Adjustable hop count (1-10) and circuit count (1-20) to balance anonymity and latency
 3. **Zero-Knowledge Relays**: Relay nodes forward encrypted data without knowledge of origin, destination, or content
 4. **Header-Only Onion Optimization**: Optional mode encrypts only routing/control headers per hop while keeping payload encrypted end-to-end
-4. **Erasure-Coded Redundancy**: Reed-Solomon coding enables reconstruction from partial shard delivery
-5. **Ephemeral Cryptography**: Per-circuit ephemeral keys prevent cross-session linkability
+5. **Erasure-Coded Redundancy**: Reed-Solomon coding enables reconstruction from partial shard delivery
+6. **Ephemeral Cryptography**: Per-circuit ephemeral keys prevent cross-session linkability
+7. **Optional CES Pipeline**: Can be disabled for simpler even-split distribution without compression/erasure coding
+8. **Configurable Padding**: Multiple padding strategies for both headers and payloads to mitigate traffic analysis
+9. **Authenticity Tags**: Optional per-shard HMAC tags for integrity verification
 
 ### High-Level Architecture
 
-The protocol consists of five major subsystems:
+The protocol consists of seven major subsystems:
 
 ```mermaid
 graph TB
     App[Application Layer]
-    StreamUpgrader[Stream Upgrader]
+    Mixnet[Mixnet Core]
     CircuitMgr[Circuit Manager]
-    CES[CES Pipeline]
+    CES[CES Pipeline - Optional]
     RelayDiscovery[Relay Discovery]
+    RelayHandler[Relay Handler]
+    Metrics[Metrics Collector]
+    ResourceMgr[Resource Manager]
     
-    App -->|read/write| StreamUpgrader
-    StreamUpgrader -->|data| CES
-    StreamUpgrader -->|manage| CircuitMgr
+    App -->|read/write| Mixnet
+    Mixnet -->|data| CES
+    Mixnet -->|manage| CircuitMgr
     CircuitMgr -->|discover| RelayDiscovery
     CES -->|shards| CircuitMgr
     CircuitMgr -->|transmit| Relay1[Relay Node 1]
     CircuitMgr -->|transmit| Relay2[Relay Node 2]
     CircuitMgr -->|transmit| Relay3[Relay Node 3]
+    Relay1 -->|forward| RelayHandler
+    RelayHandler -->|metrics| Metrics
+    RelayHandler -->|limits| ResourceMgr
     Relay1 --> Dest[Destination]
     Relay2 --> Dest
     Relay3 --> Dest
 ```
+
+**Implementation Note**: The actual Go implementation uses a `Mixnet` struct as the central coordinator rather than a separate `StreamUpgrader` interface. The `Mixnet` struct handles both origin and destination modes.
 
 ### Data Flow
 
@@ -493,6 +506,7 @@ struct LibMixConfig {
     
     // Circuit health check interval (default: 10s)
     health_check_interval: Duration,
+    
     // Relay selection mode: `rtt` | `random` | `hybrid` (default: `rtt`)
     selection_mode: SelectionMode,
 
@@ -501,6 +515,33 @@ struct LibMixConfig {
 
     // Randomness factor in [0.0,1.0] balancing RTT vs randomness (0.0 = pure RTT)
     randomness_factor: f32,
+    
+    // ===== IMPLEMENTATION-SPECIFIC ADDITIONS =====
+    
+    // Enable/disable CES pipeline (default: true)
+    // When false, data is only encrypted and evenly split across circuits
+    use_ces_pipeline: bool,
+    
+    // Encryption mode: full per-hop or header-only onion (default: full)
+    encryption_mode: EncryptionMode,
+    
+    // Header padding configuration
+    header_padding_enabled: bool,
+    header_padding_min: usize,  // default: 0
+    header_padding_max: usize,  // default: 256
+    
+    // Payload padding strategy
+    payload_padding_strategy: PaddingStrategy,  // none | random | buckets
+    payload_padding_min: usize,
+    payload_padding_max: usize,
+    payload_padding_buckets: Vec<usize>,  // e.g., [1KB, 4KB, 16KB, 64KB]
+    
+    // Authenticity tag configuration
+    enable_auth_tag: bool,      // default: false
+    auth_tag_size: usize,       // default: 16 bytes (truncated HMAC-SHA256)
+    
+    // Timing obfuscation
+    max_jitter: usize,          // max random delay in ms between shard transmissions
 }
 
 enum CompressionAlgorithm {
@@ -514,6 +555,17 @@ enum SelectionMode {
     Hybrid,
 }
 
+enum EncryptionMode {
+    Full,        // Encrypt entire payload per hop
+    HeaderOnly,  // Encrypt only routing headers per hop
+}
+
+enum PaddingStrategy {
+    None,     // No padding
+    Random,   // Random padding between min and max
+    Buckets,  // Round up to nearest bucket size
+}
+
 struct RelayConfig {
     // Maximum concurrent circuits (default: 100)
     max_circuits: usize,
@@ -521,6 +573,26 @@ struct RelayConfig {
     // Maximum bandwidth per circuit in bytes/sec (default: 10 MB/s)
     max_bandwidth_per_circuit: u64,
 }
+```
+
+**Implementation Rationale for Additions**:
+
+1. **`use_ces_pipeline`**: Added to support simpler deployments that don't need compression/erasure coding overhead. When disabled, data is encrypted and evenly split across circuits without Reed-Solomon encoding.
+
+2. **Padding Configuration**: Added to mitigate traffic analysis attacks. The design document didn't specify padding, but it's critical for production privacy:
+   - Header padding prevents relay fingerprinting based on header size
+   - Payload padding prevents message size correlation attacks
+   - Bucket padding is more efficient than random padding for common message sizes
+
+3. **`enable_auth_tag`**: Added for integrity verification. While encryption provides confidentiality, authenticity tags detect tampering or corruption during transmission. This is optional because it adds overhead.
+
+4. **`max_jitter`**: Added to break timing correlations. Without jitter, an observer can correlate shard transmissions across circuits based on timing. Random delays make this harder.
+
+**Why These Weren't in Original Design**: The original design focused on core functionality (routing, encryption, sharding). These additions address real-world deployment concerns discovered during implementation:
+- Traffic analysis resistance requires padding
+- Integrity verification is needed for production reliability
+- Timing attacks are a known weakness of mixnets
+- Not all use cases need the full CES pipeline overhead
 ```
 
 ### Circuit Structures

@@ -41,7 +41,7 @@ type Circuit struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	FailureCount   int
-	LastHeartbeat time.Time
+	LastHeartbeat  time.Time
 	mu             sync.RWMutex
 }
 
@@ -80,6 +80,19 @@ func (c *Circuit) IsActive() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.State == StateActive
+}
+
+func (c *Circuit) GetLastHeartbeat() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.LastHeartbeat
+}
+
+func (c *Circuit) SetLastHeartbeat(ts time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LastHeartbeat = ts
+	c.UpdatedAt = time.Now()
 }
 
 func (c *Circuit) Entry() peer.ID {

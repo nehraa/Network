@@ -12,7 +12,7 @@ import (
 // Compression algorithm identifiers used in the Mixnet protocol header.
 const (
 	// AlgoGzip indicates that the payload is compressed using Gzip.
-	AlgoGzip   byte = 0x01
+	AlgoGzip byte = 0x01
 	// AlgoSnappy indicates that the payload is compressed using Snappy.
 	AlgoSnappy byte = 0x02
 )
@@ -38,7 +38,7 @@ func NewCompressor(algo string) Compressor {
 	case "snappy":
 		return &snappyCompressor{}
 	default:
-		return nil
+		return invalidCompressor{algo: algo}
 	}
 }
 
@@ -53,8 +53,20 @@ func NewCompressorWithLevel(algo string, level int) Compressor {
 	case "snappy":
 		return &snappyCompressor{}
 	default:
-		return nil
+		return invalidCompressor{algo: algo}
 	}
+}
+
+type invalidCompressor struct {
+	algo string
+}
+
+func (c invalidCompressor) Compress([]byte) ([]byte, error) {
+	return nil, fmt.Errorf("unsupported compression algorithm: %s", c.algo)
+}
+
+func (c invalidCompressor) Decompress([]byte) ([]byte, error) {
+	return nil, fmt.Errorf("unsupported compression algorithm: %s", c.algo)
 }
 
 // Compress compresses data using Gzip and prepends the AlgoGzip header.
