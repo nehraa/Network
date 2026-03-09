@@ -145,7 +145,7 @@ The `MixnetConfig` allows fine-tuning the protocol:
 | `CircuitCount` | 3 | Number of parallel circuits to establish (1-20) |
 | `Compression` | "gzip" | Compression algorithm ("gzip" or "snappy") |
 | `SelectionMode` | "rtt" | Relay selection strategy ("rtt", "random", or "hybrid") |
-| `ErasureThreshold` | 60% | Number of shards required to reconstruct data |
+| `ErasureThreshold` | `0` (auto, ~60%) | Number of shards required to reconstruct data (0 = auto-derive, typically ~60% of circuits) |
 | `HeaderPaddingEnabled` | `true` | Adds randomized header padding to reduce size fingerprinting |
 | `MaxJitter` | `50` | Adds up to 50 ms of random delay between shard transmissions |
 
