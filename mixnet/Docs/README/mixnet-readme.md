@@ -149,6 +149,25 @@ The `MixnetConfig` allows fine-tuning the protocol:
 | `HeaderPaddingEnabled` | `true` | Adds randomized header padding to reduce size fingerprinting |
 | `MaxJitter` | `50` | Adds up to 50 ms of random delay between shard transmissions |
 
+### Why these flags exist
+
+The configuration surface is designed around explicit trade-offs instead of a
+single fixed deployment profile:
+
+- **Routing flags** (`HopCount`, `CircuitCount`, `SelectionMode`,
+  `SamplingSize`, `RandomnessFactor`) exist to control how much path diversity,
+  redundancy, and unpredictability the runtime uses.
+- **Payload processing flags** (`Compression`, `UseCESPipeline`,
+  `ErasureThreshold`, `EncryptionMode`) exist to balance throughput, recovery
+  behavior, and per-hop cryptographic cost.
+- **Privacy hardening flags** (`HeaderPaddingEnabled`,
+  `PayloadPaddingStrategy`, `EnableAuthTag`, `MaxJitter`) exist to reduce size-
+  and timing-based correlation signals that remain even after encryption.
+
+For a detailed explanation of each flag, the available choices, why those
+choices exist, and what benefit each one provides, see
+[`../PRD/configuration-reference.md`](../PRD/configuration-reference.md).
+
 ## Package Structure
 
 - [`README.md`](../../README.md): package guide and documentation map for the
