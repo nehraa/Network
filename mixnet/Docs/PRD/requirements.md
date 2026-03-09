@@ -286,3 +286,185 @@ Lib-Mix is a high-performance, sharded, configurable-hop mixnet protocol for lib
 3. WHEN resource limits are reached, THE Relay_Node SHALL reject new circuit establishment requests
 4. THE Relay_Node SHALL enforce bandwidth limits by applying backpressure to incoming streams
 5. THE Relay_Node SHALL expose metrics for current resource utilization
+
+---
+
+## IMPLEMENTATION-SPECIFIC REQUIREMENTS
+
+The following requirements were added during implementation to address real-world deployment concerns not covered in the original design.
+
+---
+
+### Requirement 21: Optional CES Pipeline
+
+**User Story:** As a libp2p developer, I want to disable the CES pipeline for low-latency applications, so that I can reduce overhead for small messages.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL accept a configuration parameter `use_ces_pipeline` (default: true)
+2. WHEN `use_ces_pipeline` is false, THE Lib_Mix_Protocol SHALL skip compression
+3. WHEN `use_ces_pipeline` is false, THE Lib_Mix_Protocol SHALL skip Reed-Solomon erasure coding
+4. WHEN `use_ces_pipeline` is false, THE Lib_Mix_Protocol SHALL encrypt the payload and split it evenly across circuits
+5. WHEN `use_ces_pipeline` is false, ALL circuits MUST succeed for data delivery (no redundancy)
+
+**Implementation Rationale**: For small messages (<1KB) or latency-sensitive applications, the CES pipeline overhead exceeds its benefits. This flag allows simpler deployments.
+
+---
+
+### Requirement 22: Header Padding
+
+**User Story:** As a privacy-conscious user, I want headers to be padded, so that observers cannot fingerprint relay positions by header size.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL accept configuration parameters `header_padding_enabled`, `header_padding_min`, and `header_padding_max`
+2. WHEN `header_padding_enabled` is true, THE Lib_Mix_Protocol SHALL add random padding to privacy headers
+3. THE padding size SHALL be uniformly random between `header_padding_min` and `header_padding_max` bytes
+4. THE Lib_Mix_Protocol SHALL default to `header_padding_enabled = false` for backward compatibility
+5. THE Lib_Mix_Protocol SHALL default to `header_padding_max = 256` bytes when enabled
+
+**Implementation Rationale**: Without header padding, header size reveals hop count and relay position, enabling traffic analysis attacks.
+
+---
+
+### Requirement 23: Payload Padding
+
+**User Story:** As a privacy-conscious user, I want payload padding, so that message sizes don't leak information about content.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL support three payload padding strategies: `none`, `random`, and `buckets`
+2. WHEN `payload_padding_strategy` is `random`, THE Lib_Mix_Protocol SHALL add random padding between `payload_padding_min` and `payload_padding_max` bytes
+3. WHEN `payload_padding_strategy` is `buckets`, THE Lib_Mix_Protocol SHALL round up payload size to the nearest value in `payload_padding_buckets`
+4. THE Lib_Mix_Protocol SHALL default to `payload_padding_strategy = none` for backward compatibility
+5. THE Lib_Mix_Protocol SHALL validate that bucket sizes are in ascending order
+
+**Implementation Rationale**: Message size patterns leak information (e.g., "typing" vs "sending file"). Padding breaks size-based correlation attacks.
+
+---
+
+### Requirement 24: Authenticity Tags
+
+**User Story:** As a libp2p developer, I want optional authenticity tags on shards, so that I can detect corruption or tampering early.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL accept configuration parameters `enable_auth_tag` and `auth_tag_size`
+2. WHEN `enable_auth_tag` is true, THE Lib_Mix_Protocol SHALL compute an HMAC tag for each shard
+3. THE Lib_Mix_Protocol SHALL use HMAC-SHA256 truncated to `auth_tag_size` bytes (default: 16)
+4. THE Lib_Mix_Protocol SHALL verify authenticity tags before shard reconstruction
+5. THE Lib_Mix_Protocol SHALL reject shards with invalid authenticity tags
+
+**Implementation Rationale**: Encryption provides confidentiality but not integrity verification at intermediate hops. Authenticity tags enable early detection of corruption or malicious relays.
+
+---
+
+### Requirement 25: Timing Obfuscation
+
+**User Story:** As a privacy-conscious user, I want random delays between shard transmissions, so that observers cannot correlate shards by timing.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL accept a configuration parameter `max_jitter` in milliseconds
+2. WHEN `max_jitter` > 0, THE Lib_Mix_Protocol SHALL add a random delay between 0 and `max_jitter` ms before transmitting each shard
+3. THE Lib_Mix_Protocol SHALL use a cryptographically secure random number generator for jitter
+4. THE Lib_Mix_Protocol SHALL default to `max_jitter = 0` (no jitter) for backward compatibility
+5. THE jitter SHALL be applied independently to each shard transmission
+
+**Implementation Rationale**: Without jitter, observers can correlate shards across circuits by arrival time, breaking unlinkability.
+
+---
+
+### Requirement 26: Resource Management
+
+**User Story:** As a Relay_Node operator, I want comprehensive resource management, so that my node remains stable under attack.
+
+#### Acceptance Criteria
+
+1. THE Relay_Node SHALL implement a ResourceManager component
+2. THE ResourceManager SHALL track active circuit count and bandwidth usage
+3. THE ResourceManager SHALL reject new circuits when `max_circuits` is reached
+4. THE ResourceManager SHALL apply backpressure when bandwidth limits are approached
+5. THE ResourceManager SHALL expose metrics for current resource utilization
+
+**Implementation Rationale**: The original design mentioned resource limits but didn't specify enforcement. Implementation showed this is critical for DoS protection.
+
+---
+
+### Requirement 27: Metrics Collection
+
+**User Story:** As a libp2p developer, I want comprehensive metrics, so that I can monitor and debug my deployment.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL collect metrics for circuits established, failed, and recovered
+2. THE Lib_Mix_Protocol SHALL collect metrics for shards transmitted, received, and failed
+3. THE Lib_Mix_Protocol SHALL collect metrics for bytes transmitted and received
+4. THE Lib_Mix_Protocol SHALL calculate average circuit RTT and compression ratio
+5. THE Lib_Mix_Protocol SHALL expose metrics via a MetricsCollector interface
+
+**Implementation Rationale**: The original design mentioned metrics but didn't specify what to collect. These are the critical metrics for production operation.
+
+---
+
+### Requirement 28: Failure Detection
+
+**User Story:** As an Origin peer, I want proactive failure detection, so that circuits are recovered before data loss occurs.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL implement a CircuitFailureNotifier component
+2. THE CircuitFailureNotifier SHALL allow registration of failure callbacks
+3. THE Lib_Mix_Protocol SHALL monitor circuit health via periodic heartbeats
+4. WHEN a circuit fails, THE Lib_Mix_Protocol SHALL invoke registered callbacks
+5. THE Lib_Mix_Protocol SHALL attempt automatic circuit recovery when possible
+
+**Implementation Rationale**: The original design relied on passive failure detection (timeout on send). Active monitoring enables faster recovery.
+
+---
+
+### Requirement 29: Session Management
+
+**User Story:** As a Destination peer, I want to handle multiple concurrent streams, so that I can support multiple clients simultaneously.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL implement a DestinationHandler component
+2. THE DestinationHandler SHALL maintain separate shard buffers per session ID
+3. THE DestinationHandler SHALL maintain separate encryption keys per session ID
+4. THE DestinationHandler SHALL implement per-session timeouts
+5. THE DestinationHandler SHALL clean up stale sessions after timeout
+
+**Implementation Rationale**: The original design assumed single-stream operation. Real-world use requires concurrent connections.
+
+---
+
+### Requirement 30: Protocol Versioning
+
+**User Story:** As a libp2p developer, I want protocol versioning, so that I can upgrade without breaking existing deployments.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL include a version field in all protocol frames
+2. THE Lib_Mix_Protocol SHALL support version `0x01` (full onion encryption)
+3. THE Lib_Mix_Protocol SHALL support version `0x02` (header-only encryption)
+4. THE Lib_Mix_Protocol SHALL reject frames with unsupported version numbers
+5. THE Lib_Mix_Protocol SHALL allow future version additions without breaking changes
+
+**Implementation Rationale**: The original design assumed a single protocol version. Versioning is essential for protocol evolution.
+
+---
+
+### Requirement 31: Transport Capability Detection
+
+**User Story:** As a libp2p developer, I want to detect supported transports, so that I can choose the optimal transport for each peer.
+
+#### Acceptance Criteria
+
+1. THE Lib_Mix_Protocol SHALL implement a DetectTransportCapabilities function
+2. THE function SHALL parse peer multiaddrs to extract supported transports
+3. THE function SHALL return a TransportInfo struct with supported protocols
+4. THE Lib_Mix_Protocol SHALL verify peers support standard transports (TCP, QUIC, WebRTC)
+5. THE Lib_Mix_Protocol SHALL provide a SupportsStandardTransport helper function
+
+**Implementation Rationale**: The original design assumed libp2p handles transport selection automatically. Explicit detection improves reliability and debugging.
