@@ -152,14 +152,24 @@ func (r *RelayDiscovery) selectRandom(peers []peer.AddrInfo, count int) ([]Relay
 
 func (r *RelayDiscovery) selectByRTT(ctx context.Context, peers []peer.AddrInfo, count int) ([]RelayInfo, error) {
 	sampled := r.sampleFromPool(peers)
+	if len(sampled) < count {
+		return nil, fmt.Errorf("insufficient peers: have %d, need %d", len(sampled), count)
+	}
+
 	latencies, err := r.measureLatencies(ctx, sampled)
 	if err != nil {
 		return nil, err
 	}
 
 	sort.Slice(sampled, func(i, j int) bool {
-		li := latencies[sampled[i].ID]
-		lj := latencies[sampled[j].ID]
+		li, okI := latencies[sampled[i].ID]
+		lj, okJ := latencies[sampled[j].ID]
+		if !okI || li <= 0 {
+			li = time.Duration(1<<63 - 1)
+		}
+		if !okJ || lj <= 0 {
+			lj = time.Duration(1<<63 - 1)
+		}
 		return li < lj
 	})
 
@@ -173,10 +183,12 @@ func (r *RelayDiscovery) selectByRTT(ctx context.Context, peers []peer.AddrInfo,
 		if used[p.ID] {
 			continue
 		}
+		latency, available := latencies[p.ID]
 		result = append(result, RelayInfo{
-			PeerID:   p.ID,
-			AddrInfo: p,
-			Latency:  latencies[p.ID],
+			PeerID:    p.ID,
+			AddrInfo:  p,
+			Latency:   latency,
+			Available: available && latency > 0,
 		})
 		used[p.ID] = true
 	}
@@ -285,7 +297,7 @@ loop:
 
 	var ctxErr error
 	for res := range rc {
-		if res.err == nil {
+		if res.err == nil && res.latency > 0 {
 			result[res.peerID] = res.latency
 		}
 		if ctxErr == nil && ctx.Err() != nil {
@@ -347,13 +359,18 @@ type weightedPeer struct {
 
 func (r *RelayDiscovery) buildCircuitsWithWeights(peers []peer.AddrInfo, latencies map[peer.ID]time.Duration, circuitCount, hopCount int, randomnessFactor float64) []RelayInfo {
 	var weightedPeers []weightedPeer
+	effectiveLatencies := make(map[peer.ID]time.Duration, len(peers))
 	for _, p := range peers {
-		lat := latencies[p.ID]
-		if lat == 0 {
+		lat, ok := latencies[p.ID]
+		if !ok || lat <= 0 {
 			lat = 100 * time.Millisecond
 		}
+		effectiveLatencies[p.ID] = lat
 		weight := 1.0 / (float64(lat.Milliseconds()) + 1)
 		weightedPeers = append(weightedPeers, weightedPeer{p, weight})
+	}
+	if len(weightedPeers) == 0 {
+		return nil
 	}
 
 	var result []RelayInfo
@@ -375,9 +392,10 @@ func (r *RelayDiscovery) buildCircuitsWithWeights(peers []peer.AddrInfo, latenci
 				continue
 			}
 			result = append(result, RelayInfo{
-				PeerID:   selected.peer.ID,
-				AddrInfo: selected.peer,
-				Latency:  latencies[selected.peer.ID],
+				PeerID:    selected.peer.ID,
+				AddrInfo:  selected.peer,
+				Latency:   effectiveLatencies[selected.peer.ID],
+				Available: latencies[selected.peer.ID] > 0,
 			})
 			used[selected.peer.ID] = true
 		}
@@ -416,19 +434,27 @@ func (r *RelayDiscovery) weightedSelect(peers []weightedPeer, randomnessFactor f
 // SelectRelaysForCircuit selects a set of relays for a single circuit.
 func (r *RelayDiscovery) SelectRelaysForCircuit(ctx context.Context, peers []peer.AddrInfo, hopCount int, randomnessFactor float64) ([]RelayInfo, error) {
 	sampled := r.randomSample(peers, r.samplingSize)
+	if len(sampled) < hopCount {
+		return nil, fmt.Errorf("insufficient relays")
+	}
 	latencies, err := r.measureLatencies(ctx, sampled)
 	if err != nil {
 		return nil, err
 	}
 
 	var weightedPeers []weightedPeer
+	effectiveLatencies := make(map[peer.ID]time.Duration, len(sampled))
 	for _, p := range sampled {
-		lat := latencies[p.ID]
-		if lat == 0 {
+		lat, ok := latencies[p.ID]
+		if !ok || lat <= 0 {
 			lat = 100 * time.Millisecond
 		}
+		effectiveLatencies[p.ID] = lat
 		weight := 1.0 / float64(lat.Milliseconds()+1)
 		weightedPeers = append(weightedPeers, weightedPeer{p, weight})
+	}
+	if len(weightedPeers) < hopCount {
+		return nil, fmt.Errorf("insufficient relays")
 	}
 
 	var result []RelayInfo
@@ -447,9 +473,10 @@ func (r *RelayDiscovery) SelectRelaysForCircuit(ctx context.Context, peers []pee
 		selected := r.weightedSelect(available, randomnessFactor)
 		if selected != nil {
 			result = append(result, RelayInfo{
-				PeerID:   selected.peer.ID,
-				AddrInfo: selected.peer,
-				Latency:  latencies[selected.peer.ID],
+				PeerID:    selected.peer.ID,
+				AddrInfo:  selected.peer,
+				Latency:   effectiveLatencies[selected.peer.ID],
+				Available: latencies[selected.peer.ID] > 0,
 			})
 			used[selected.peer.ID] = true
 		}

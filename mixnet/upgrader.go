@@ -72,23 +72,23 @@ type PendingTransmission struct {
 
 // DestinationHandler handles the reception and reconstruction of incoming shards at the destination.
 type DestinationHandler struct {
-	pipeline    *ces.CESPipeline
-	shardBuf    map[string][]*ces.Shard
-	shardTags   map[string]map[int][]byte
-	totalShards map[string]int
-	timers      map[string]*time.Timer
-	sessions    map[string]chan []byte
-	keys        map[string]sessionKey
-	keyData     map[string][]byte
-	inboundCh   chan string
-	threshold   int
-	timeout     time.Duration
-	dataCh      chan []byte
-	stopCh      chan struct{}
+	pipeline        *ces.CESPipeline
+	shardBuf        map[string][]*ces.Shard
+	shardTags       map[string]map[int][]byte
+	totalShards     map[string]int
+	timers          map[string]*time.Timer
+	sessions        map[string]chan []byte
+	keys            map[string]sessionKey
+	keyData         map[string][]byte
+	inboundCh       chan string
+	threshold       int
+	timeout         time.Duration
+	dataCh          chan []byte
+	stopCh          chan struct{}
 	useLengthPrefix bool
 	authEnabled     bool
 	authTagSize     int
-	mu          sync.Mutex
+	mu              sync.Mutex
 }
 
 const (
@@ -175,19 +175,19 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 		activeConnections: make(map[peer.ID][]*circuit.Circuit),
 		pendingShards:     make(map[peer.ID]*PendingTransmission),
 		destHandler: &DestinationHandler{
-			pipeline:    pipeline,
-			shardBuf:    make(map[string][]*ces.Shard),
-			shardTags:   make(map[string]map[int][]byte),
-			totalShards: make(map[string]int),
-			timers:      make(map[string]*time.Timer),
-			sessions:    make(map[string]chan []byte),
-			keys:        make(map[string]sessionKey),
-			keyData:     make(map[string][]byte),
-			inboundCh:   make(chan string, 100),
-			threshold:   cfg.GetErasureThreshold(),
-			timeout:     30 * time.Second,
-			dataCh:      make(chan []byte, 100),
-			stopCh:      make(chan struct{}),
+			pipeline:        pipeline,
+			shardBuf:        make(map[string][]*ces.Shard),
+			shardTags:       make(map[string]map[int][]byte),
+			totalShards:     make(map[string]int),
+			timers:          make(map[string]*time.Timer),
+			sessions:        make(map[string]chan []byte),
+			keys:            make(map[string]sessionKey),
+			keyData:         make(map[string][]byte),
+			inboundCh:       make(chan string, 100),
+			threshold:       cfg.GetErasureThreshold(),
+			timeout:         30 * time.Second,
+			dataCh:          make(chan []byte, 100),
+			stopCh:          make(chan struct{}),
 			useLengthPrefix: cfg.PayloadPaddingStrategy != PaddingStrategyNone,
 			authEnabled:     cfg.EnableAuthTag,
 			authTagSize:     cfg.AuthTagSize,
@@ -1226,59 +1226,121 @@ func (m *Mixnet) RecoverFromFailure(ctx context.Context, dest peer.ID) error {
 	m.mu.RLock()
 	circuits, ok := m.activeConnections[dest]
 	m.mu.RUnlock()
-
 	if !ok {
 		return ErrCircuitFailed(fmt.Sprintf("no active connection to %s", dest))
 	}
 
-	activeCount := 0
-	for _, c := range circuits {
-		if c.IsActive() {
-			activeCount++
-		}
-	}
-
 	threshold := m.config.GetErasureThreshold()
+	targetCircuits := m.config.CircuitCount
 	m.metrics.RecordRecovery()
 
-	// Discover fresh relays so we don't rebuild with stale/failed ones (Req 10.3).
-	newRelays, err := m.discoverRelays(ctx, dest)
-	if err != nil {
-		return ErrDiscoveryFailed("failed to discover relays for recovery").WithCause(err)
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return ErrCircuitFailed(fmt.Sprintf("recovery timed out after %d attempts", attempt)).WithCause(ctx.Err())
+		}
+
+		// Quarantine entry relays used by non-active circuits for this recovery
+		// pass so we don't keep reusing relays that likely just failed.
+		quarantinedRelays := make(map[peer.ID]struct{})
+		for _, c := range circuits {
+			if c == nil || c.IsActive() {
+				continue
+			}
+			if entry := c.Entry(); entry != "" {
+				quarantinedRelays[entry] = struct{}{}
+			}
+		}
+
+		// Discover fresh relays so we don't rebuild with stale/failed ones (Req 10.3).
+		newRelays, err := m.discoverRelays(ctx, dest)
+		if err != nil {
+			return ErrDiscoveryFailed("failed to discover relays for recovery").WithCause(err)
+		}
+		if len(quarantinedRelays) > 0 {
+			filtered := make([]circuit.RelayInfo, 0, len(newRelays))
+			for _, r := range newRelays {
+				if _, blocked := quarantinedRelays[r.PeerID]; blocked {
+					continue
+				}
+				filtered = append(filtered, r)
+			}
+			newRelays = filtered
+		}
+		// Update the circuit manager relay pool with freshly discovered relays.
+		m.circuitMgr.UpdateRelayPool(newRelays)
+
+		poolContains := make(map[peer.ID]struct{}, len(newRelays))
+		for _, r := range newRelays {
+			poolContains[r.PeerID] = struct{}{}
+		}
+		// If any active circuit still contains a relay that was dropped from discovery,
+		// mark it failed so it can be rebuilt.
+		for i, c := range circuits {
+			if c == nil || !c.IsActive() {
+				continue
+			}
+			for _, p := range c.Peers {
+				if _, quarantined := quarantinedRelays[p]; quarantined {
+					m.circuitMgr.MarkCircuitFailed(c.ID)
+					_ = m.circuitMgr.CloseCircuit(c.ID)
+					circuits[i] = c
+					break
+				}
+				if _, ok := poolContains[p]; !ok {
+					m.circuitMgr.MarkCircuitFailed(c.ID)
+					_ = m.circuitMgr.CloseCircuit(c.ID)
+					circuits[i] = c
+					break
+				}
+			}
+		}
+
+		for i, c := range circuits {
+			if c == nil {
+				continue
+			}
+			if !c.IsActive() {
+				newCircuit, err := m.circuitMgr.RebuildCircuit(c.ID)
+				if err != nil {
+					continue
+				}
+				err = m.circuitMgr.EstablishCircuit(newCircuit, dest, relay.ProtocolID)
+				if err != nil {
+					continue
+				}
+				keys, err := m.establishCircuitKeys(ctx, newCircuit)
+				if err != nil {
+					_ = m.circuitMgr.CloseCircuit(newCircuit.ID)
+					continue
+				}
+				m.setCircuitKeys(m.circuitKeyID(newCircuit), keys)
+				m.circuitMgr.ActivateCircuit(newCircuit.ID)
+				circuits[i] = newCircuit
+				m.metrics.RecordCircuitSuccess()
+			}
+		}
+
+		m.mu.Lock()
+		m.activeConnections[dest] = circuits
+		m.mu.Unlock()
+
+		activeCount := m.circuitMgr.ActiveCircuitCount()
+		if m.config.UseCESPipeline {
+			if activeCount >= targetCircuits {
+				break
+			}
+		} else if activeCount >= threshold {
+			break
+		}
+
+		// Backoff a bit before trying again so discovery/state can settle.
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ErrCircuitFailed(fmt.Sprintf("recovery timed out after %d attempts", attempt)).WithCause(ctx.Err())
+		}
 	}
 
-	// Update the circuit manager relay pool with freshly discovered relays.
-	m.circuitMgr.UpdateRelayPool(newRelays)
-
-	for i, c := range circuits {
-		if c == nil {
-			continue
-		}
-		if !c.IsActive() {
-			newCircuit, err := m.circuitMgr.RebuildCircuit(c.ID)
-			if err != nil {
-				continue
-			}
-
-			err = m.circuitMgr.EstablishCircuit(newCircuit, dest, relay.ProtocolID)
-			if err != nil {
-				continue
-			}
-			keys, err := m.establishCircuitKeys(ctx, newCircuit)
-			if err != nil {
-				_ = m.circuitMgr.CloseCircuit(newCircuit.ID)
-				continue
-			}
-			m.setCircuitKeys(m.circuitKeyID(newCircuit), keys)
-
-			m.circuitMgr.ActivateCircuit(newCircuit.ID)
-			circuits[i] = newCircuit
-			m.metrics.RecordCircuitSuccess()
-		}
-	}
-	m.mu.Lock()
-	m.activeConnections[dest] = circuits
-	m.mu.Unlock()
 	m.StartHeartbeatMonitoring(defaultHeartbeatInterval)
 
 	if !m.circuitMgr.CanRecover() {

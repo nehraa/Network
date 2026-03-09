@@ -430,12 +430,46 @@ func (m *CircuitManager) RebuildCircuit(failedID string) (*Circuit, error) {
 		failedPeers[p] = true
 	}
 
-	var available []peer.ID
+	poolContains := make(map[peer.ID]struct{}, len(m.relayPool))
 	for _, id := range m.relayPool {
-		if failedPeers[id] {
-			continue
+		poolContains[id] = struct{}{}
+	}
+
+	missingFailedPeers := 0
+	for _, p := range failedCircuit.Peers {
+		if _, ok := poolContains[p]; !ok {
+			missingFailedPeers++
 		}
-		inUse := false
+	}
+
+	selected := make([]peer.ID, 0, m.cfg.HopCount)
+	selectedSet := make(map[peer.ID]struct{}, m.cfg.HopCount)
+
+	// If discovery already dropped at least one relay from the failed path, preserve
+	// the surviving hops first and only replace the missing/failed ones.
+	if missingFailedPeers > 0 {
+		for _, p := range failedCircuit.Peers {
+			if _, ok := poolContains[p]; !ok {
+				continue
+			}
+			selected = append(selected, p)
+			selectedSet[p] = struct{}{}
+		}
+	}
+
+	addRelay := func(id peer.ID) bool {
+		if len(selected) >= m.cfg.HopCount {
+			return true
+		}
+		if _, ok := selectedSet[id]; ok {
+			return false
+		}
+		selected = append(selected, id)
+		selectedSet[id] = struct{}{}
+		return len(selected) >= m.cfg.HopCount
+	}
+
+	relayInUse := func(id peer.ID) bool {
 		for _, c := range m.circuits {
 			state := c.GetState()
 			if state == StateFailed || state == StateClosed {
@@ -443,24 +477,44 @@ func (m *CircuitManager) RebuildCircuit(failedID string) (*Circuit, error) {
 			}
 			for _, p := range c.Peers {
 				if p == id {
-					inUse = true
-					break
+					return true
 				}
 			}
-			if inUse {
+		}
+		return false
+	}
+
+	for _, id := range m.relayPool {
+		if failedPeers[id] {
+			continue
+		}
+		if relayInUse(id) {
+			continue
+		}
+		if addRelay(id) {
+			break
+		}
+	}
+
+	// Recovery is allowed to reuse relays across different circuits as a last resort,
+	// but never within the same circuit. This keeps recovery viable when discovery has
+	// already pruned the dead relay and there is no fully spare path available.
+	if len(selected) < m.cfg.HopCount && missingFailedPeers > 0 {
+		for _, id := range m.relayPool {
+			if failedPeers[id] {
+				continue
+			}
+			if addRelay(id) {
 				break
 			}
 		}
-		if !inUse {
-			available = append(available, id)
-		}
 	}
 
-	if len(available) < m.cfg.HopCount {
-		return nil, fmt.Errorf("insufficient available relays: have %d, need %d", len(available), m.cfg.HopCount)
+	if len(selected) < m.cfg.HopCount {
+		return nil, fmt.Errorf("insufficient available relays: have %d, need %d", len(selected), m.cfg.HopCount)
 	}
 
-	peers := available[:m.cfg.HopCount]
+	peers := selected[:m.cfg.HopCount]
 	circuit := NewCircuit(fmt.Sprintf("%s-rebuilt", failedID), peers)
 	circuit.SetState(StateBuilding)
 

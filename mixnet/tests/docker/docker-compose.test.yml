@@ -1,0 +1,100 @@
+services:
+  # Mixnet node 1 - Origin (sender)
+  mixnet-origin:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-origin
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.10
+
+  # Mixnet node 2 - Destination (receiver)
+  mixnet-destination:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-destination
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.11
+
+  # Mixnet relay nodes (7 relays for a 9-node network)
+  mixnet-relay-1:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-1
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.20
+
+  mixnet-relay-2:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-2
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.21
+
+  mixnet-relay-3:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-3
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.22
+
+  mixnet-relay-4:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-4
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.23
+
+  mixnet-relay-5:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-5
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.24
+
+  mixnet-relay-6:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-6
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.25
+
+  mixnet-relay-7:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.test
+    container_name: mixnet-relay-7
+    command: ["sh", "-c", "sleep infinity"]
+    networks:
+      mixnet-net:
+        ipv4_address: 10.10.1.26
+
+networks:
+  mixnet-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/16
