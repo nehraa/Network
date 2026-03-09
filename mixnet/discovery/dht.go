@@ -262,11 +262,13 @@ func (r *RelayDiscovery) measureLatencies(ctx context.Context, peers []peer.Addr
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
 
+loop:
 	for _, p := range peers {
-		if ctx.Err() != nil {
-			break
+		select {
+		case <-ctx.Done():
+			break loop
+		case sem <- struct{}{}:
 		}
-		sem <- struct{}{}
 		wg.Add(1)
 		go func(addrInfo peer.AddrInfo) {
 			defer wg.Done()

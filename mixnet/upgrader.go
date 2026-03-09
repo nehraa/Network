@@ -97,6 +97,11 @@ const (
 	msgTypeCloseAck byte = 0x02
 )
 
+// maxInboundShardSize is the upper bound on the number of bytes read from a single
+// inbound stream at the destination. This prevents a malicious peer from forcing
+// unbounded memory allocation before the stream deadline fires.
+const maxInboundShardSize int64 = relay.MaxPayloadSize * 4 // 256 KiB
+
 // NewMixnet creates a new Mixnet instance with the provided configuration, host, and routing.
 func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, error) {
 	if err := cfg.Validate(); err != nil {
@@ -590,11 +595,17 @@ func (m *Mixnet) ReceiveHandler() func(network.Stream) {
 func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	defer stream.Close()
 
-	// Read the shard data with timeout
+	// Read the shard data with timeout, bounded to maxInboundShardSize to
+	// prevent a peer from causing unbounded memory allocation.
 	stream.SetDeadline(time.Now().Add(m.destHandler.timeout))
 
-	shardData, err := io.ReadAll(stream)
+	shardData, err := io.ReadAll(io.LimitReader(stream, maxInboundShardSize+1))
 	if err != nil || len(shardData) == 0 {
+		return
+	}
+
+	// Reject frames that hit or exceed the size cap.
+	if int64(len(shardData)) > maxInboundShardSize {
 		return
 	}
 
