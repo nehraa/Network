@@ -10,7 +10,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// MixStream provides a read/write stream interface over Mixnet.
+// MixStream exposes a stream-style API on top of the mixnet session machinery.
+//
+// An outbound MixStream is created by OpenStream and remembers the destination
+// peer and caller context. An inbound MixStream is created by AcceptStream and
+// only supports reading until the remote side closes or the context is
+// cancelled.
 type MixStream struct {
 	mixnet    *Mixnet
 	dest      peer.ID
@@ -23,7 +28,11 @@ type MixStream struct {
 	readBuf   []byte
 }
 
-// OpenStream creates a Mixnet stream to the destination.
+// OpenStream establishes mixnet circuits to dest and returns an outbound stream
+// wrapper bound to a fresh session ID.
+//
+// The returned stream reuses the supplied context for reads and writes so that
+// callers can cancel a long-running session using standard context semantics.
 func (m *Mixnet) OpenStream(ctx context.Context, dest peer.ID) (*MixStream, error) {
 	if _, err := m.EstablishConnection(ctx, dest); err != nil {
 		return nil, err
@@ -39,6 +48,11 @@ func (m *Mixnet) OpenStream(ctx context.Context, dest peer.ID) (*MixStream, erro
 	}, nil
 }
 
+// Read copies reconstructed payload bytes into p.
+//
+// If a previous read left buffered data behind, Read drains that buffer first.
+// Otherwise it waits for the destination handler to deliver the next
+// reconstructed message fragment for this session.
 func (s *MixStream) Read(p []byte) (int, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -80,6 +94,11 @@ func (s *MixStream) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// Write sends p to the remote destination using the stream session ID.
+//
+// Inbound-only streams do not have a destination peer and therefore reject
+// writes. For outbound streams, Write delegates to Mixnet.SendWithSession so
+// that successive writes stay associated with the same logical session.
 func (s *MixStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -98,6 +117,11 @@ func (s *MixStream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Close marks the stream closed and unregisters its session from the
+// destination handler.
+//
+// Close is idempotent. It does not tear down the underlying mixnet runtime, but
+// it stops future reads and writes for this session wrapper.
 func (s *MixStream) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -111,7 +135,11 @@ func (s *MixStream) Close() error {
 	return nil
 }
 
-// AcceptStream waits for an inbound mixnet session and returns a MixStream for it.
+// AcceptStream waits for the next inbound mixnet session and returns a stream
+// wrapper that reads reconstructed payloads for that session.
+//
+// The method blocks until a remote peer starts sending on a new session or the
+// supplied context is cancelled.
 func (m *Mixnet) AcceptStream(ctx context.Context) (*MixStream, error) {
 	if m.destHandler == nil {
 		return nil, fmt.Errorf("no destination handler")

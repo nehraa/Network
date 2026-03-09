@@ -23,7 +23,7 @@ This document provides a complete reference for all configuration options in the
 ### `Compression`
 - **Type**: `string`
 - **Values**: `"gzip"`, `"snappy"`
-- **Default**: `"snappy"`
+- **Default**: `"gzip"`
 - **Description**: Compression algorithm for CES pipeline
 - **Performance Impact**: Gzip = better compression, Snappy = lower latency
 - **Requirement**: Req 3
@@ -99,7 +99,7 @@ This document provides a complete reference for all configuration options in the
 
 ### `HeaderPaddingEnabled`
 - **Type**: `bool`
-- **Default**: `false`
+- **Default**: `true`
 - **Description**: Enable random padding in privacy headers
 - **When to Enable**: High-privacy deployments
 - **Privacy Impact**: Prevents relay fingerprinting by header size
@@ -108,7 +108,7 @@ This document provides a complete reference for all configuration options in the
 
 ### `HeaderPaddingMin`
 - **Type**: `int`
-- **Default**: 0
+- **Default**: 16
 - **Description**: Minimum header padding in bytes
 - **Recommendation**: Set to 0 for efficiency
 
@@ -137,13 +137,13 @@ This document provides a complete reference for all configuration options in the
 
 ### `PayloadPaddingMax`
 - **Type**: `int`
-- **Default**: 1024
+- **Default**: 0
 - **Description**: Maximum random padding in bytes (for `random` strategy)
 - **Recommendation**: Set to 50-100% of average message size
 
 ### `PayloadPaddingBuckets`
 - **Type**: `[]int`
-- **Default**: `[1024, 4096, 16384, 65536]` (1KB, 4KB, 16KB, 64KB)
+- **Default**: unset (`nil`)
 - **Description**: Target sizes for bucket padding
 - **Recommendation**: Choose buckets based on your message size distribution
 - **Example**: For chat app: `[256, 1024, 4096]` (short, medium, long messages)
@@ -176,7 +176,7 @@ This document provides a complete reference for all configuration options in the
 
 ### `MaxJitter`
 - **Type**: `int` (milliseconds)
-- **Default**: 0 (disabled)
+- **Default**: 50
 - **Description**: Maximum random delay between shard transmissions
 - **When to Enable**: High-privacy deployments
 - **Privacy Impact**: Breaks timing correlations between shards
@@ -254,7 +254,7 @@ This document provides a complete reference for all configuration options in the
 config := &MixnetConfig{
     HopCount:               1,
     CircuitCount:           2,
-    Compression:            "snappy",
+    Compression:            "gzip",
     ErasureThreshold:       1,
     UseCESPipeline:         false,
     EncryptionMode:         "header-only",
@@ -270,13 +270,16 @@ config := &MixnetConfig{
 config := &MixnetConfig{
     HopCount:               2,
     CircuitCount:           3,
-    Compression:            "snappy",
+    Compression:            "gzip",
     ErasureThreshold:       2,
     UseCESPipeline:         true,
     EncryptionMode:         "full",
     SelectionMode:          "rtt",
+    HeaderPaddingEnabled:   true,
+    HeaderPaddingMin:       16,
+    HeaderPaddingMax:       256,
     PayloadPaddingStrategy: "none",
-    MaxJitter:              0,
+    MaxJitter:              50,
 }
 ```
 **Use Case**: General-purpose applications
@@ -308,7 +311,7 @@ config := &MixnetConfig{
 config := &MixnetConfig{
     HopCount:               2,
     CircuitCount:           5,
-    Compression:            "snappy",
+    Compression:            "gzip",
     ErasureThreshold:       3,
     UseCESPipeline:         true,
     EncryptionMode:         "header-only",
