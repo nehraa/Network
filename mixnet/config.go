@@ -34,6 +34,15 @@ const (
 	EncryptionModeHeaderOnly EncryptionMode = "header-only"
 )
 
+// PaddingStrategy defines how payload length padding is applied.
+type PaddingStrategy string
+
+const (
+	PaddingStrategyNone    PaddingStrategy = "none"
+	PaddingStrategyRandom  PaddingStrategy = "random"
+	PaddingStrategyBuckets PaddingStrategy = "buckets"
+)
+
 // MixnetConfig holds the configuration parameters for a Mixnet instance.
 type MixnetConfig struct {
 	mu     sync.RWMutex
@@ -47,6 +56,27 @@ type MixnetConfig struct {
 	Compression string
 	// ErasureThreshold is the minimum number of shards required to reconstruct the data.
 	ErasureThreshold int
+	// UseCESPipeline enables the CES (Compress-Encrypt-Shard) pipeline.
+	// When disabled, payloads are only encrypted and evenly split across circuits.
+	UseCESPipeline bool
+	// HeaderPaddingEnabled enables padding in privacy headers.
+	HeaderPaddingEnabled bool
+	// HeaderPaddingMin is the minimum header padding in bytes.
+	HeaderPaddingMin int
+	// HeaderPaddingMax is the maximum header padding in bytes.
+	HeaderPaddingMax int
+	// PayloadPaddingStrategy controls length padding to mitigate compression/size leakage.
+	PayloadPaddingStrategy PaddingStrategy
+	// PayloadPaddingMin is the minimum random padding in bytes (used with random strategy).
+	PayloadPaddingMin int
+	// PayloadPaddingMax is the maximum random padding in bytes (used with random strategy).
+	PayloadPaddingMax int
+	// PayloadPaddingBuckets are target sizes in bytes for bucket padding.
+	PayloadPaddingBuckets []int
+	// EnableAuthTag enables per-shard authenticity tags.
+	EnableAuthTag bool
+	// AuthTagSize is the size of the authenticity tag in bytes (truncated HMAC).
+	AuthTagSize int
 
 	// SelectionMode defines the relay selection strategy.
 	SelectionMode SelectionMode
@@ -70,6 +100,10 @@ func DefaultConfig() *MixnetConfig {
 		CircuitCount:     3,
 		Compression:      "gzip",
 		ErasureThreshold: 0, // 0 means default to 60% of CircuitCount
+		UseCESPipeline:   true,
+		HeaderPaddingEnabled: true,
+		HeaderPaddingMin:     16,
+		HeaderPaddingMax:     256,
 
 		// Relay selection defaults
 		SelectionMode:    SelectionModeRTT,
@@ -82,6 +116,14 @@ func DefaultConfig() *MixnetConfig {
 
 		// Encryption defaults
 		EncryptionMode: EncryptionModeFull,
+
+		// Padding/auth defaults
+		PayloadPaddingStrategy: PaddingStrategyNone,
+		PayloadPaddingMin:      0,
+		PayloadPaddingMax:      0,
+		PayloadPaddingBuckets:  nil,
+		EnableAuthTag:          false,
+		AuthTagSize:            16,
 	}
 }
 
@@ -94,6 +136,16 @@ func NewMixnetConfig() *MixnetConfig {
 	cfg.CircuitCount = 0
 	cfg.Compression = ""
 	cfg.ErasureThreshold = 0
+	cfg.UseCESPipeline = true
+	cfg.HeaderPaddingEnabled = false
+	cfg.HeaderPaddingMin = 0
+	cfg.HeaderPaddingMax = 0
+	cfg.PayloadPaddingStrategy = PaddingStrategyNone
+	cfg.PayloadPaddingMin = 0
+	cfg.PayloadPaddingMax = 0
+	cfg.PayloadPaddingBuckets = nil
+	cfg.EnableAuthTag = false
+	cfg.AuthTagSize = 0
 	cfg.SelectionMode = ""
 	cfg.SamplingSize = 0
 	cfg.RandomnessFactor = 0
@@ -104,8 +156,8 @@ func NewMixnetConfig() *MixnetConfig {
 
 // Validate checks if the configuration parameters are within acceptable ranges.
 func (c *MixnetConfig) Validate() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Hop count validation (Req 1.2)
 	if c.HopCount < 1 || c.HopCount > 10 {
@@ -118,21 +170,23 @@ func (c *MixnetConfig) Validate() error {
 	}
 
 	// Compression algorithm validation (Req 3.2)
-	if c.Compression != "gzip" && c.Compression != "snappy" {
-		return fmt.Errorf("compression must be gzip or snappy, got %s", c.Compression)
-	}
-
-	// Erasure threshold validation (Req 15.3)
-	threshold := c.ErasureThreshold
-	if threshold == 0 {
-		// ceil(N * 0.6)
-		threshold = (c.CircuitCount*6 + 9) / 10
-		if threshold < 1 {
-			threshold = 1
+	if c.UseCESPipeline {
+		if c.Compression != "gzip" && c.Compression != "snappy" {
+			return fmt.Errorf("compression must be gzip or snappy, got %s", c.Compression)
 		}
-	}
-	if threshold >= c.CircuitCount {
-		return fmt.Errorf("erasure threshold must be less than circuit count, got %d >= %d", threshold, c.CircuitCount)
+
+		// Erasure threshold validation (Req 15.3)
+		threshold := c.ErasureThreshold
+		if threshold == 0 {
+			// ceil(N * 0.6)
+			threshold = (c.CircuitCount*6 + 9) / 10
+			if threshold < 1 {
+				threshold = 1
+			}
+		}
+		if threshold >= c.CircuitCount {
+			return fmt.Errorf("erasure threshold must be less than circuit count, got %d >= %d", threshold, c.CircuitCount)
+		}
 	}
 
 	// Selection mode validation (Req 4.6)
@@ -163,6 +217,44 @@ func (c *MixnetConfig) Validate() error {
 	}
 	if c.EncryptionMode != EncryptionModeFull && c.EncryptionMode != EncryptionModeHeaderOnly {
 		return fmt.Errorf("encryption mode must be full or header-only, got %s", c.EncryptionMode)
+	}
+
+	// Padding strategy validation
+	if c.PayloadPaddingStrategy == "" {
+		c.PayloadPaddingStrategy = PaddingStrategyNone
+	}
+	if c.PayloadPaddingStrategy != PaddingStrategyNone && c.PayloadPaddingStrategy != PaddingStrategyRandom && c.PayloadPaddingStrategy != PaddingStrategyBuckets {
+		return fmt.Errorf("padding strategy must be none, random, or buckets, got %s", c.PayloadPaddingStrategy)
+	}
+	if c.PayloadPaddingStrategy == PaddingStrategyRandom {
+		if c.PayloadPaddingMin < 0 || c.PayloadPaddingMax < 0 || c.PayloadPaddingMax < c.PayloadPaddingMin {
+			return fmt.Errorf("invalid padding range: min=%d max=%d", c.PayloadPaddingMin, c.PayloadPaddingMax)
+		}
+	}
+	if c.PayloadPaddingStrategy == PaddingStrategyBuckets {
+		if len(c.PayloadPaddingBuckets) == 0 {
+			return fmt.Errorf("padding buckets required for bucket strategy")
+		}
+		prev := 0
+		for _, b := range c.PayloadPaddingBuckets {
+			if b <= 0 || b < prev {
+				return fmt.Errorf("padding buckets must be positive and sorted")
+			}
+			prev = b
+		}
+	}
+	if c.EnableAuthTag {
+		if c.AuthTagSize <= 0 || c.AuthTagSize > 32 {
+			return fmt.Errorf("auth tag size must be 1-32 bytes, got %d", c.AuthTagSize)
+		}
+	}
+	if c.HeaderPaddingEnabled {
+		if c.HeaderPaddingMin < 0 || c.HeaderPaddingMax < 0 || c.HeaderPaddingMax < c.HeaderPaddingMin {
+			return fmt.Errorf("invalid header padding range: min=%d max=%d", c.HeaderPaddingMin, c.HeaderPaddingMax)
+		}
+		if c.HeaderPaddingMax == 0 {
+			return fmt.Errorf("header padding max must be > 0 when enabled")
+		}
 	}
 
 	return nil
@@ -212,6 +304,30 @@ func (c *MixnetConfig) SetErasureThreshold(n int) error {
 	return nil
 }
 
+// SetUseCESPipeline enables or disables the CES pipeline.
+func (c *MixnetConfig) SetUseCESPipeline(enabled bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.UseCESPipeline = enabled
+	return nil
+}
+
+// SetHeaderPadding configures privacy header padding.
+func (c *MixnetConfig) SetHeaderPadding(enabled bool, minBytes, maxBytes int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.HeaderPaddingEnabled = enabled
+	c.HeaderPaddingMin = minBytes
+	c.HeaderPaddingMax = maxBytes
+	return nil
+}
+
 // SetSelectionMode sets the relay selection strategy.
 func (c *MixnetConfig) SetSelectionMode(mode SelectionMode) error {
 	c.mu.Lock()
@@ -231,6 +347,52 @@ func (c *MixnetConfig) SetEncryptionMode(mode EncryptionMode) error {
 		return ErrConfigImmutable
 	}
 	c.EncryptionMode = mode
+	return nil
+}
+
+// SetPayloadPaddingStrategy sets the payload padding strategy.
+func (c *MixnetConfig) SetPayloadPaddingStrategy(strategy PaddingStrategy) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.PayloadPaddingStrategy = strategy
+	return nil
+}
+
+// SetPayloadPaddingRange sets the random padding range.
+func (c *MixnetConfig) SetPayloadPaddingRange(min, max int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.PayloadPaddingMin = min
+	c.PayloadPaddingMax = max
+	return nil
+}
+
+// SetPayloadPaddingBuckets sets the bucket sizes for padding.
+func (c *MixnetConfig) SetPayloadPaddingBuckets(buckets []int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.PayloadPaddingBuckets = buckets
+	return nil
+}
+
+// SetAuthTag enables or disables per-shard authenticity tags.
+func (c *MixnetConfig) SetAuthTag(enabled bool, size int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.EnableAuthTag = enabled
+	c.AuthTagSize = size
 	return nil
 }
 
@@ -262,6 +424,10 @@ func (c *MixnetConfig) SetRandomnessFactor(f float64) error {
 func (c *MixnetConfig) GetErasureThreshold() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	if !c.UseCESPipeline {
+		return c.CircuitCount
+	}
 
 	if c.ErasureThreshold != 0 {
 		return c.ErasureThreshold
@@ -310,6 +476,16 @@ func (c *MixnetConfig) InitDefaults() {
 	}
 	if c.RandomnessFactor == 0 {
 		c.RandomnessFactor = 0.3
+	}
+	if c.PayloadPaddingStrategy == "" {
+		c.PayloadPaddingStrategy = PaddingStrategyNone
+	}
+	if c.AuthTagSize == 0 {
+		c.AuthTagSize = 16
+	}
+	if c.HeaderPaddingEnabled && c.HeaderPaddingMin == 0 && c.HeaderPaddingMax == 0 {
+		c.HeaderPaddingMin = 16
+		c.HeaderPaddingMax = 256
 	}
 }
 

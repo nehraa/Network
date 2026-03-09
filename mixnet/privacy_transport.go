@@ -153,6 +153,8 @@ type PrivacyShardHeader struct {
 	HasKeys bool
 	// KeyData encrypted key material (for first shard only)
 	KeyData []byte
+	// AuthTag provides authenticity for the shard payload (optional).
+	AuthTag []byte
 	// Padding random bytes to hide message size
 	Padding []byte
 }
@@ -176,13 +178,10 @@ func DefaultPrivacyPaddingConfig() *PrivacyPaddingConfig {
 	}
 }
 
-// PaddingConfig is the global padding configuration
-var PaddingConfig = DefaultPrivacyPaddingConfig()
-
 // EncodePrivacyShard encodes a shard with privacy-enhanced header.
-func EncodePrivacyShard(shardData []byte, header PrivacyShardHeader) ([]byte, error) {
+func EncodePrivacyShard(shardData []byte, header PrivacyShardHeader, paddingCfg *PrivacyPaddingConfig) ([]byte, error) {
 	// Build header without destination
-	// Format: [session_len(1)][session_id][shard_idx(4)][total_shards(4)][has_keys(1)][key_len(4)][keys][padding_len(2)][padding][shard]
+	// Format: [session_len(1)][session_id][shard_idx(4)][total_shards(4)][has_keys(1)][key_len(4)][keys][auth_len(2)][auth][padding_len(2)][padding][shard]
 
 	var headerBytes []byte
 
@@ -229,9 +228,22 @@ func EncodePrivacyShard(shardData []byte, header PrivacyShardHeader) ([]byte, er
 		headerBytes = append(headerBytes, header.KeyData...)
 	}
 
+	// auth_len + auth_tag
+	authLen := uint16(0)
+	if header.AuthTag != nil {
+		if len(header.AuthTag) > int(^uint16(0)) {
+			return nil, fmt.Errorf("auth tag too large")
+		}
+		authLen = uint16(len(header.AuthTag))
+	}
+	headerBytes = append(headerBytes, byte(authLen), byte(authLen>>8))
+	if authLen > 0 {
+		headerBytes = append(headerBytes, header.AuthTag...)
+	}
+
 	// Add padding if enabled
-	if PaddingConfig.Enabled {
-		padding := generateRandomPadding(PaddingConfig.MinBytes, PaddingConfig.MaxBytes)
+	if paddingCfg != nil && paddingCfg.Enabled {
+		padding := generateRandomPadding(paddingCfg.MinBytes, paddingCfg.MaxBytes)
 		header.Padding = padding
 
 		paddingLen := uint16(len(padding))
@@ -294,6 +306,22 @@ func DecodePrivacyShard(data []byte) (*PrivacyShardHeader, []byte, error) {
 		offset += int(keyLen)
 	}
 
+	// auth_len + auth_tag
+	if len(data) < offset+2 {
+		return nil, nil, fmt.Errorf("data too short for auth length")
+	}
+	authLen := uint16(data[offset]) | uint16(data[offset+1])<<8
+	offset += 2
+
+	var authTag []byte
+	if authLen > 0 {
+		if len(data) < offset+int(authLen) {
+			return nil, nil, fmt.Errorf("data too short for auth tag")
+		}
+		authTag = data[offset : offset+int(authLen)]
+		offset += int(authLen)
+	}
+
 	// padding_len + padding
 	if len(data) < offset+2 {
 		return nil, nil, fmt.Errorf("data too short for padding length")
@@ -319,6 +347,7 @@ func DecodePrivacyShard(data []byte) (*PrivacyShardHeader, []byte, error) {
 		TotalShards: totalShards,
 		HasKeys:     hasKeys,
 		KeyData:     keyData,
+		AuthTag:     authTag,
 		Padding:     padding,
 	}, shardData, nil
 }

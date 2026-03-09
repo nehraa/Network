@@ -12,7 +12,7 @@ type Shard struct {
 	// Index is the unique position of this shard in the original set.
 	Index int
 	// Data is the raw encrypted payload of the shard.
-	Data  []byte
+	Data []byte
 }
 
 // Sharder implements Reed-Solomon erasure coding to provide data redundancy across multiple paths.
@@ -20,6 +20,7 @@ type Sharder struct {
 	totalShards int
 	threshold   int // = dataShards
 	encoder     reedsolomon.Encoder
+	initErr     error
 }
 
 // NewSharder creates a new Sharder instance.
@@ -27,12 +28,20 @@ type Sharder struct {
 // threshold is the minimum number of shards required for reconstruction.
 func NewSharder(totalShards, threshold int) *Sharder {
 	if threshold < 1 || threshold >= totalShards {
-		panic(fmt.Sprintf("invalid sharder params: totalShards=%d threshold=%d", totalShards, threshold))
+		return &Sharder{
+			totalShards: totalShards,
+			threshold:   threshold,
+			initErr:     fmt.Errorf("invalid sharder params: totalShards=%d threshold=%d", totalShards, threshold),
+		}
 	}
 	parityShards := totalShards - threshold
 	enc, err := reedsolomon.New(threshold, parityShards)
 	if err != nil {
-		panic(fmt.Sprintf("failed to create reed-solomon encoder: %v", err))
+		return &Sharder{
+			totalShards: totalShards,
+			threshold:   threshold,
+			initErr:     fmt.Errorf("failed to create reed-solomon encoder: %w", err),
+		}
 	}
 	return &Sharder{
 		totalShards: totalShards,
@@ -43,6 +52,12 @@ func NewSharder(totalShards, threshold int) *Sharder {
 
 // Shard splits the data into totalShards pieces, including parity shards for redundancy.
 func (s *Sharder) Shard(data []byte) ([]*Shard, error) {
+	if s == nil {
+		return nil, fmt.Errorf("sharder is nil")
+	}
+	if s.initErr != nil {
+		return nil, s.initErr
+	}
 	dataShards := s.threshold
 
 	// Prepend 8-byte original data length so we can trim padding on reconstruction.
@@ -84,6 +99,12 @@ func (s *Sharder) Shard(data []byte) ([]*Shard, error) {
 
 // Reconstruct uses Reed-Solomon decoding to recover the original data from a partial set of shards.
 func (s *Sharder) Reconstruct(shards []*Shard) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("sharder is nil")
+	}
+	if s.initErr != nil {
+		return nil, s.initErr
+	}
 	if len(shards) < s.threshold {
 		return nil, fmt.Errorf("insufficient shards: have %d, need %d", len(shards), s.threshold)
 	}

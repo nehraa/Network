@@ -3,9 +3,12 @@ package discovery
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -131,7 +134,8 @@ func (r *RelayDiscovery) selectRandom(peers []peer.AddrInfo, count int) ([]Relay
 
 	shuffled := make([]peer.AddrInfo, len(peers))
 	copy(shuffled, peers)
-	rand.Shuffle(len(shuffled), func(i, j int) {
+	rng := newRand()
+	rng.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	})
 
@@ -220,7 +224,8 @@ func (r *RelayDiscovery) randomSample(peers []peer.AddrInfo, k int) []peer.AddrI
 	}
 	shuffled := make([]peer.AddrInfo, len(peers))
 	copy(shuffled, peers)
-	rand.Shuffle(len(shuffled), func(i, j int) {
+	rng := newRand()
+	rng.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	})
 	return shuffled[:k]
@@ -246,25 +251,57 @@ func (r *RelayDiscovery) measureLatencies(ctx context.Context, peers []peer.Addr
 
 	rc := make(chan resultChan, len(peers))
 
+	maxConcurrent := 32
+	if len(peers) < maxConcurrent {
+		maxConcurrent = len(peers)
+	}
+	if maxConcurrent == 0 {
+		return result, nil
+	}
+
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
 	for _, p := range peers {
+		if ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
 		go func(addrInfo peer.AddrInfo) {
+			defer wg.Done()
+			defer func() { <-sem }()
 			latency, err := r.measureRTTToPeer(ctx, addrInfo)
 			rc <- resultChan{addrInfo.ID, latency, err}
 		}(p)
 	}
 
-	for i := 0; i < len(peers); i++ {
-		select {
-		case <-ctx.Done():
-			return result, fmt.Errorf("context cancelled during latency measurement")
-		case res := <-rc:
-			if res.err == nil {
-				result[res.peerID] = res.latency
-			}
+	go func() {
+		wg.Wait()
+		close(rc)
+	}()
+
+	var ctxErr error
+	for res := range rc {
+		if res.err == nil {
+			result[res.peerID] = res.latency
+		}
+		if ctxErr == nil && ctx.Err() != nil {
+			ctxErr = fmt.Errorf("context cancelled during latency measurement")
 		}
 	}
-
+	if ctxErr != nil {
+		return result, ctxErr
+	}
 	return result, nil
+}
+
+func newRand() *rand.Rand {
+	var seed int64
+	if err := binary.Read(crand.Reader, binary.LittleEndian, &seed); err != nil {
+		seed = time.Now().UnixNano()
+	}
+	return rand.New(rand.NewSource(seed))
 }
 
 // measureRTTToPeer measures round-trip time to a peer using the libp2p ping protocol.

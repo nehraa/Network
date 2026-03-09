@@ -41,16 +41,19 @@ func NewLayeredEncrypter(hopCount int) *LayeredEncrypter {
 	}
 }
 
-// deriveKeyFromNoise derives a symmetric key using HKDF-SHA256
-// This implements Req 1.5 - using Noise Protocol key derivation (same method as libp2p)
+// deriveKeyFromNoise derives a symmetric key with a random salt mixed into the
+// derivation input. This ensures keys are unpredictable even if destinations are public.
 func deriveKeyFromNoise(prologue []byte, hopIndex int) ([]byte, error) {
-	// Use HKDF with SHA-256 for key derivation (same as Noise Protocol)
-	// Create derivation input: prologue || hopIndex
-	derivationInput := make([]byte, len(prologue)+8)
+	salt := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+
+	derivationInput := make([]byte, len(prologue)+8+len(salt))
 	copy(derivationInput, prologue)
 	binary.BigEndian.PutUint64(derivationInput[len(prologue):], uint64(hopIndex))
+	copy(derivationInput[len(prologue)+8:], salt)
 
-	// Use SHA-256 to derive key material (HKDF-expand)
 	h := sha256.New()
 	h.Write(derivationInput)
 	h.Write([]byte("libp2p-mixnet-key derivation"))
@@ -72,7 +75,7 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 
 	// Generate ephemeral keys for each layer using Noise-derived key derivation
 	for i := 0; i < e.hopCount; i++ {
-		// Use Noise HKDF-like key derivation for proper key separation (Req 1.5)
+		// Derive a per-hop key with random salt to prevent key predictability.
 		prologue := fmt.Sprintf("lib-mix-hop-%d-%s", i, destinations[i])
 		key, err := deriveKeyFromNoise([]byte(prologue), i)
 		if err != nil {
