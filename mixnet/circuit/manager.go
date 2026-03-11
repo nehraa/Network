@@ -41,6 +41,8 @@ type StreamHandler struct {
 	peerID peer.ID
 }
 
+const maxCircuitWriteChunk = 32 * 1024
+
 // Stream returns the underlying libp2p stream bound to the circuit.
 func (h *StreamHandler) Stream() network.Stream {
 	return h.stream
@@ -184,6 +186,16 @@ func (m *CircuitManager) EstablishCircuit(circuit *Circuit, dest peer.ID, protoc
 	if err != nil {
 		return fmt.Errorf("failed to open stream to %s: %w", entryPeer, err)
 	}
+	// Force multistream negotiation to flush before the first application write.
+	// Without this, lazy negotiation can bundle a large shard payload into the
+	// initial write and block on yamux flow control before the relay handler
+	// starts consuming application data.
+	if flusher, ok := stream.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = stream.Reset()
+			return fmt.Errorf("failed to negotiate stream to %s: %w", entryPeer, err)
+		}
+	}
 
 	m.mu.Lock()
 	m.streams[circuit.ID] = &StreamHandler{
@@ -205,8 +217,21 @@ func (m *CircuitManager) SendData(circuitID string, data []byte) error {
 		return fmt.Errorf("no stream for circuit %s", circuitID)
 	}
 
-	_, err := handler.stream.Write(data)
-	return err
+	for len(data) > 0 {
+		chunk := data
+		if len(chunk) > maxCircuitWriteChunk {
+			chunk = chunk[:maxCircuitWriteChunk]
+		}
+		n, err := handler.stream.Write(chunk)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return fmt.Errorf("short write on circuit %s", circuitID)
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 // ReadData reads raw bytes from the libp2p stream associated with circuitID.

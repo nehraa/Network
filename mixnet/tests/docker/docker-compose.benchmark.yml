@@ -1,0 +1,29 @@
+# Docker Compose configuration for Mixnet benchmarks
+# Provides isolated containers for consistent benchmark measurements
+
+services:
+  mixnet-benchmark-runner:
+    build:
+      context: ../../..
+      dockerfile: mixnet/tests/docker/Dockerfile.benchmark
+    container_name: mixnet-benchmark-runner
+    command: ["sh", "-c", "sleep infinity"]
+    volumes:
+      - ../../../mixnet/benchmarks/results:/app/mixnet/benchmarks/results
+    networks:
+      mixnet-bench-net:
+        ipv4_address: 10.20.0.100
+    environment:
+      - GOMAXPROCS=1
+      - BENCHMARK_ITERATIONS=6
+      - MIXNET_FAST_CLOSE=1
+      - MIXNET_STREAM_TIMEOUT=15m
+      - MIXNET_MAX_ENCRYPTED_PAYLOAD=33554432
+
+networks:
+  mixnet-bench-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.20.0.0/16

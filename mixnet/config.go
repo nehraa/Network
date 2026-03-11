@@ -96,11 +96,11 @@ type MixnetConfig struct {
 // DefaultConfig returns a MixnetConfig with recommended default values.
 func DefaultConfig() *MixnetConfig {
 	return &MixnetConfig{
-		HopCount:         2,
-		CircuitCount:     3,
-		Compression:      "gzip",
-		ErasureThreshold: 0, // 0 means default to 60% of CircuitCount
-		UseCESPipeline:   true,
+		HopCount:             2,
+		CircuitCount:         3,
+		Compression:          "gzip",
+		ErasureThreshold:     0, // 0 means default to 60% of CircuitCount
+		UseCESPipeline:       true,
 		HeaderPaddingEnabled: true,
 		HeaderPaddingMin:     16,
 		HeaderPaddingMax:     256,
@@ -184,7 +184,7 @@ func (c *MixnetConfig) Validate() error {
 				threshold = 1
 			}
 		}
-		if threshold >= c.CircuitCount {
+		if threshold > c.CircuitCount || (threshold == c.CircuitCount && c.CircuitCount != 1) {
 			return fmt.Errorf("erasure threshold must be less than circuit count, got %d >= %d", threshold, c.CircuitCount)
 		}
 	}

@@ -50,3 +50,30 @@ func buildHeaderOnlyPayload(encryptedHeader []byte, payload []byte) []byte {
 	copy(buf[4+len(encryptedHeader):], payload)
 	return buf
 }
+
+// encodeHeaderOnlyFrame builds the full wire frame in a single allocation.
+// Format: [circuit_id_len][circuit_id][version][payload_len][header_len][encrypted_header][payload]
+func encodeHeaderOnlyFrame(circuitID string, encryptedHeader []byte, payload []byte) ([]byte, error) {
+	if len(circuitID) == 0 || len(circuitID) > 255 {
+		return nil, fmt.Errorf("invalid circuit id")
+	}
+	framePayloadLen := 4 + len(encryptedHeader) + len(payload)
+	totalLen := 1 + len(circuitID) + 1 + 4 + framePayloadLen
+
+	buf := make([]byte, totalLen)
+	pos := 0
+	buf[pos] = byte(len(circuitID))
+	pos++
+	copy(buf[pos:], circuitID)
+	pos += len(circuitID)
+	buf[pos] = frameVersionHeaderOnly
+	pos++
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(framePayloadLen))
+	pos += 4
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(encryptedHeader)))
+	pos += 4
+	copy(buf[pos:], encryptedHeader)
+	pos += len(encryptedHeader)
+	copy(buf[pos:], payload)
+	return buf, nil
+}

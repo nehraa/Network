@@ -2,8 +2,11 @@ package mixnet
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,7 +29,14 @@ type MixStream struct {
 	mu        sync.Mutex
 	closed    bool
 	readBuf   []byte
+	writeSeq  uint64
 }
+
+const (
+	streamSessionIDBytes = 20
+	streamWriteDelimiter = "~"
+	streamWriteSeqWidth  = 16
+)
 
 // OpenStream establishes mixnet circuits to dest and returns an outbound stream
 // wrapper bound to a fresh session ID.
@@ -37,7 +47,7 @@ func (m *Mixnet) OpenStream(ctx context.Context, dest peer.ID) (*MixStream, erro
 	if _, err := m.EstablishConnection(ctx, dest); err != nil {
 		return nil, err
 	}
-	sessionID := normalizeSessionID(fmt.Sprintf("%s-%d", dest.String(), time.Now().UnixNano()))
+	sessionID := newStreamSessionID()
 	ch := m.destHandler.registerSession(sessionID)
 	return &MixStream{
 		mixnet:    m,
@@ -109,9 +119,11 @@ func (s *MixStream) Write(p []byte) (int, error) {
 		s.mu.Unlock()
 		return 0, fmt.Errorf("cannot write to inbound-only stream")
 	}
+	wireSessionID := streamWriteSessionID(s.sessionID, s.writeSeq)
+	s.writeSeq++
 	s.mu.Unlock()
 
-	if err := s.mixnet.SendWithSession(s.ctx, s.dest, p, s.sessionID); err != nil {
+	if err := s.mixnet.SendWithSession(s.ctx, s.dest, p, wireSessionID); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -157,4 +169,27 @@ func (m *Mixnet) AcceptStream(ctx context.Context) (*MixStream, error) {
 			ch:        ch,
 		}, nil
 	}
+}
+
+func newStreamSessionID() string {
+	buf := make([]byte, streamSessionIDBytes)
+	if _, err := rand.Read(buf); err == nil {
+		return hex.EncodeToString(buf)
+	}
+	return normalizeSessionID(fmt.Sprintf("stream-%d", time.Now().UnixNano()))
+}
+
+func streamWriteSessionID(base string, seq uint64) string {
+	return fmt.Sprintf("%s%s%0*x", base, streamWriteDelimiter, streamWriteSeqWidth, seq)
+}
+
+func baseSessionID(sessionID string) string {
+	idx := strings.LastIndex(sessionID, streamWriteDelimiter)
+	if idx <= 0 || len(sessionID)-idx-1 != streamWriteSeqWidth {
+		return sessionID
+	}
+	if _, err := hex.DecodeString(sessionID[idx+1:]); err != nil {
+		return sessionID
+	}
+	return sessionID[:idx]
 }

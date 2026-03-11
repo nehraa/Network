@@ -204,24 +204,9 @@ func (rm *ResourceManager) RecordBandwidth(bytes int64, direction string) {
 	rm.bandwidthMu.Lock()
 	defer rm.bandwidthMu.Unlock()
 
-	rm.currentBandwidth += bytes
 	now := time.Now()
-
-	// Reset per-second tracking
-	if now.Sub(rm.lastBandwidthCheck) >= time.Second {
-		rm.bandwidthPerSec = rm.currentBandwidth
-		rm.currentBandwidth = 0
-		rm.lastBandwidthCheck = now
-
-		// Check if we're over bandwidth limit (AC 20.4 - Backpressure)
-		if rm.config.EnableBackpressure && rm.bandwidthPerSec > rm.config.MaxBandwidthBytesPerSec {
-			select {
-			case rm.backpressureCh <- struct{}{}:
-			default:
-				// Channel full, skip
-			}
-		}
-	}
+	rm.rotateBandwidthWindowLocked(now)
+	rm.currentBandwidth += bytes
 }
 
 // CanSend checks if we can send more data based on bandwidth limits (AC 20.4).
@@ -232,6 +217,7 @@ func (rm *ResourceManager) CanSend(bytes int64) bool {
 
 	rm.bandwidthMu.Lock()
 	defer rm.bandwidthMu.Unlock()
+	rm.rotateBandwidthWindowLocked(time.Now())
 
 	// Check if adding these bytes would exceed limit
 	projected := rm.currentBandwidth + bytes
@@ -263,6 +249,55 @@ func (rm *ResourceManager) WaitForBandwidth(ctx context.Context, bytes int64) er
 			continue
 		}
 	}
+}
+
+func (rm *ResourceManager) rotateBandwidthWindowLocked(now time.Time) {
+	if rm == nil {
+		return
+	}
+	if rm.lastBandwidthCheck.IsZero() {
+		rm.lastBandwidthCheck = now
+		return
+	}
+	if now.Sub(rm.lastBandwidthCheck) < time.Second {
+		return
+	}
+
+	rm.bandwidthPerSec = rm.currentBandwidth
+	rm.currentBandwidth = 0
+	rm.lastBandwidthCheck = now
+
+	// Check if we're over bandwidth limit (AC 20.4 - Backpressure).
+	if rm.config.EnableBackpressure && rm.config.MaxBandwidthBytesPerSec > 0 && rm.bandwidthPerSec > rm.config.MaxBandwidthBytesPerSec {
+		select {
+		case rm.backpressureCh <- struct{}{}:
+		default:
+			// Channel full, skip.
+		}
+	}
+}
+
+// SetBandwidthLimit updates the per-second bandwidth limit. Non-positive values disable the limit.
+func (rm *ResourceManager) SetBandwidthLimit(maxBytesPerSec int64) {
+	if rm == nil || rm.config == nil {
+		return
+	}
+
+	rm.bandwidthMu.Lock()
+	defer rm.bandwidthMu.Unlock()
+	rm.rotateBandwidthWindowLocked(time.Now())
+	rm.config.MaxBandwidthBytesPerSec = maxBytesPerSec
+}
+
+// SetBackpressureEnabled toggles bandwidth backpressure enforcement.
+func (rm *ResourceManager) SetBackpressureEnabled(enabled bool) {
+	if rm == nil || rm.config == nil {
+		return
+	}
+
+	rm.bandwidthMu.Lock()
+	defer rm.bandwidthMu.Unlock()
+	rm.config.EnableBackpressure = enabled
 }
 
 // BackpressureChan returns a channel that signals when backpressure is needed.

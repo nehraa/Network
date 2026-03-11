@@ -157,7 +157,7 @@ func TestProductionSanity(t *testing.T) {
 			{"bad hop count", &MixnetConfig{HopCount: 0, CircuitCount: 2, UseCESPipeline: false}},
 			{"bad circuit count", &MixnetConfig{HopCount: 2, CircuitCount: 0, UseCESPipeline: false}},
 			{"bad compression", &MixnetConfig{HopCount: 2, CircuitCount: 2, UseCESPipeline: true, Compression: "bad"}},
-			{"ces threshold >= count", &MixnetConfig{HopCount: 1, CircuitCount: 1, UseCESPipeline: true, Compression: "gzip"}},
+			{"ces threshold >= count", &MixnetConfig{HopCount: 1, CircuitCount: 2, UseCESPipeline: true, Compression: "gzip", ErasureThreshold: 2}},
 			{"bad selection mode", &MixnetConfig{HopCount: 2, CircuitCount: 2, UseCESPipeline: false, SelectionMode: "bad"}},
 			{"bad sampling size", &MixnetConfig{HopCount: 2, CircuitCount: 2, UseCESPipeline: false, SamplingSize: 1}},
 			{"bad randomness", &MixnetConfig{HopCount: 2, CircuitCount: 2, UseCESPipeline: false, RandomnessFactor: 1.5}},

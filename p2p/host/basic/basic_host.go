@@ -691,6 +691,13 @@ func (s *streamWrapper) Close() error {
 	return s.rw.Close()
 }
 
+func (s *streamWrapper) Flush() error {
+	if flusher, ok := s.rw.(interface{ Flush() error }); ok {
+		return flusher.Flush()
+	}
+	return nil
+}
+
 func (s *streamWrapper) CloseWrite() error {
 	// Flush the handshake before closing, but ignore the error. The other
 	// end may have closed their side for reading.

@@ -91,16 +91,29 @@ type DestinationHandler struct {
 	mu              sync.Mutex
 }
 
+const sessionChannelBuffer = 2048
+
 const (
 	msgTypeData     byte = 0x00
 	msgTypeCloseReq byte = 0x01
 	msgTypeCloseAck byte = 0x02
 )
 
-// maxInboundShardSize is the upper bound on the number of bytes read from a single
-// inbound stream at the destination. This prevents a malicious peer from forcing
-// unbounded memory allocation before the stream deadline fires.
-const maxInboundShardSize int64 = relay.MaxPayloadSize * 4 // 256 KiB
+// maxInboundShardSize returns the upper bound on the number of bytes read from a
+// single inbound stream at the destination. This prevents a malicious peer from
+// forcing unbounded memory allocation before the stream deadline fires.
+func maxInboundShardSize() int64 {
+	return int64(relay.MaxEncryptedPayloadSize())
+}
+
+func configuredStreamTimeout(defaultTimeout time.Duration) time.Duration {
+	if raw := os.Getenv("MIXNET_STREAM_TIMEOUT"); raw != "" {
+		if timeout, err := time.ParseDuration(raw); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultTimeout
+}
 
 // NewMixnet creates a new Mixnet instance with the provided configuration, host, and routing.
 func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, error) {
@@ -121,7 +134,7 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 	circuitCfg := &circuit.CircuitConfig{
 		HopCount:      cfg.HopCount,
 		CircuitCount:  cfg.CircuitCount,
-		StreamTimeout: 30 * time.Second,
+		StreamTimeout: configuredStreamTimeout(30 * time.Second),
 	}
 	circuitMgr := circuit.NewCircuitManager(circuitCfg)
 	circuitMgr.SetHost(h)
@@ -599,13 +612,20 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	// prevent a peer from causing unbounded memory allocation.
 	stream.SetDeadline(time.Now().Add(m.destHandler.timeout))
 
-	shardData, err := io.ReadAll(io.LimitReader(stream, maxInboundShardSize+1))
+	inboundLimit := maxInboundShardSize()
+	shardData, err := io.ReadAll(io.LimitReader(stream, inboundLimit+1))
 	if err != nil || len(shardData) == 0 {
+		if err != nil && os.Getenv("LIBP2P_MIXNET_BENCH_DEBUG") != "" {
+			log.Printf("[mixnet bench host=%s] inbound read failed: %v", m.host.ID(), err)
+		}
 		return
 	}
 
 	// Reject frames that hit or exceed the size cap.
-	if int64(len(shardData)) > maxInboundShardSize {
+	if int64(len(shardData)) > inboundLimit {
+		if os.Getenv("LIBP2P_MIXNET_BENCH_DEBUG") != "" {
+			log.Printf("[mixnet bench host=%s] inbound shard too large: got=%d limit=%d", m.host.ID(), len(shardData), inboundLimit)
+		}
 		return
 	}
 	if len(shardData) < 1 {
@@ -624,6 +644,9 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	// Parse data payload (msgType already stripped by relay).
 	sessionID, shard, keyData, authTag, totalShards, err := m.parseShardPayload(shardData[1:])
 	if err != nil {
+		if os.Getenv("LIBP2P_MIXNET_BENCH_DEBUG") != "" {
+			log.Printf("[mixnet bench host=%s] parse shard failed: %v", m.host.ID(), err)
+		}
 		return
 	}
 
@@ -636,6 +659,9 @@ func (m *Mixnet) handleIncomingStream(stream network.Stream) {
 	// Check if we can reconstruct using the correct session ID
 	data, err := m.destHandler.TryReconstruct(sessionID)
 	if err != nil {
+		if os.Getenv("LIBP2P_MIXNET_BENCH_DEBUG") != "" {
+			log.Printf("[mixnet bench host=%s] reconstruct pending session=%s shard=%d total=%d key=%t err=%v", m.host.ID(), sessionID, shard.Index, totalShards, len(keyData) > 0, err)
+		}
 		return
 	}
 
@@ -825,7 +851,7 @@ func (h *DestinationHandler) verifyAuthTags(sessionID string, shards []*ces.Shar
 		if !ok {
 			return ErrEncryptionFailed(fmt.Sprintf("missing auth tag for shard %d", sh.Index))
 		}
-		includeKeys := sh.Index == 0 && len(keyPayload) > 0
+		includeKeys := len(keyPayload) > 0
 		var payload []byte
 		if includeKeys {
 			payload = keyPayload
@@ -850,20 +876,22 @@ func hmacEqual(a, b []byte) bool {
 }
 
 func (h *DestinationHandler) registerSession(sessionID string) chan []byte {
+	sessionID = baseSessionID(sessionID)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if ch, ok := h.sessions[sessionID]; ok {
 		return ch
 	}
-	ch := make(chan []byte, 10)
+	ch := make(chan []byte, sessionChannelBuffer)
 	h.sessions[sessionID] = ch
 	return ch
 }
 
 func (h *DestinationHandler) ensureSession(sessionID string) {
+	sessionID = baseSessionID(sessionID)
 	h.mu.Lock()
 	if _, ok := h.sessions[sessionID]; !ok {
-		ch := make(chan []byte, 10)
+		ch := make(chan []byte, sessionChannelBuffer)
 		h.sessions[sessionID] = ch
 		select {
 		case h.inboundCh <- sessionID:
@@ -874,23 +902,22 @@ func (h *DestinationHandler) ensureSession(sessionID string) {
 }
 
 func (h *DestinationHandler) unregisterSession(sessionID string) {
+	sessionID = baseSessionID(sessionID)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closeSessionLocked(sessionID)
 }
 
 func (h *DestinationHandler) deliverSessionData(sessionID string, data []byte) {
+	sessionID = baseSessionID(sessionID)
 	h.mu.Lock()
 	ch, ok := h.sessions[sessionID]
 	if !ok {
 		h.mu.Unlock()
 		return
 	}
-	// Keep lock held during non-blocking send so the channel cannot be closed concurrently.
-	select {
-	case ch <- data:
-	default:
-	}
+	// Keep lock held while enqueueing so the channel cannot be closed concurrently.
+	ch <- data
 	h.mu.Unlock()
 }
 
@@ -960,6 +987,21 @@ func (m *Mixnet) Close() error {
 
 	// Unregister the protocol handler (Req 12).
 	m.host.RemoveStreamHandler(ProtocolID)
+
+	if os.Getenv("MIXNET_FAST_CLOSE") == "1" {
+		err := m.circuitMgr.Close()
+		if m.pipeline != nil {
+			m.pipeline.Encrypter().SecureErase()
+		}
+		m.clearCircuitKeys()
+		for range m.activeConnections {
+			m.metrics.CircuitClosed()
+		}
+		if err != nil {
+			return ErrCircuitFailed("failed to close circuit manager").WithCause(err)
+		}
+		return nil
+	}
 
 	// Send close signal through all active circuits and wait for acknowledgment (Req 18)
 	m.mu.RLock()
@@ -1043,6 +1085,10 @@ func (m *Mixnet) ensureCircuitKeys(ctx context.Context, circuits []*circuit.Circ
 		if c == nil {
 			continue
 		}
+		keyID := m.circuitKeyID(c)
+		if keys, ok := m.getCircuitKeys(keyID); ok && len(keys) == len(c.Peers) {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1051,7 +1097,7 @@ func (m *Mixnet) ensureCircuitKeys(ctx context.Context, circuits []*circuit.Circ
 				errCh <- err
 				return
 			}
-			m.setCircuitKeys(m.circuitKeyID(c), keys)
+			m.setCircuitKeys(keyID, keys)
 		}()
 	}
 
@@ -1492,6 +1538,8 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 	var wg sync.WaitGroup
 	errCh := make(chan error, sendCount)
 	paddingCfg := m.headerPaddingConfig()
+	concurrencyLimit := sendCount
+	sendSem := make(chan struct{}, concurrencyLimit)
 
 	for i := 0; i < sendCount; i++ {
 		// Apply jitter for all shards after the first to break timing correlations.
@@ -1513,12 +1561,16 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 		wg.Add(1)
 		go func(shardData []byte, circuitID string, idx int) {
 			defer wg.Done()
+			sendSem <- struct{}{}
+			defer func() { <-sendSem }()
 
 			shardIndex := shard.Index
 			if shardIndex < 0 {
 				shardIndex = idx
 			}
-			includeKeys := len(keyData) > 0 && shardIndex == 0
+			// Duplicate session key material on every shard so any threshold-sized
+			// subset can be decrypted without depending on shard 0 arriving.
+			includeKeys := len(keyData) > 0
 			var keyPayload []byte
 			if includeKeys {
 				keyPayload = keyData
@@ -1527,19 +1579,6 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 			if m.config.EnableAuthTag && authKey != nil {
 				authTag = computeAuthTag(*authKey, sessionIDBytes, uint32(shardIndex), uint32(sendCount), shardData, includeKeys, keyPayload, m.config.AuthTagSize)
 			}
-			privacyShard, err := EncodePrivacyShard(shardData, PrivacyShardHeader{
-				SessionID:   sessionIDBytes,
-				ShardIndex:  uint32(shardIndex),
-				TotalShards: uint32(sendCount),
-				HasKeys:     includeKeys,
-				KeyData:     keyPayload,
-				AuthTag:     authTag,
-			}, paddingCfg)
-			if err != nil {
-				errCh <- ErrProtocolError("failed to encode privacy shard").WithCause(err)
-				return
-			}
-
 			keyID := m.circuitKeyID(circuits[idx])
 			hopKeys, ok := m.getCircuitKeys(keyID)
 			if !ok {
@@ -1566,13 +1605,24 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 					errCh <- ErrEncryptionFailed(fmt.Sprintf("failed to encrypt header for circuit %s", circuitID)).WithCause(err)
 					return
 				}
-				payload := buildHeaderOnlyPayload(onionHeader, shardData)
-				fullData, err = encodeEncryptedFrameWithVersion(keyID, frameVersionHeaderOnly, payload)
+				fullData, err = encodeHeaderOnlyFrame(keyID, onionHeader, shardData)
 				if err != nil {
 					errCh <- ErrProtocolError("failed to frame header-only shard").WithCause(err)
 					return
 				}
 			default:
+				privacyShard, err := EncodePrivacyShard(shardData, PrivacyShardHeader{
+					SessionID:   sessionIDBytes,
+					ShardIndex:  uint32(shardIndex),
+					TotalShards: uint32(sendCount),
+					HasKeys:     includeKeys,
+					KeyData:     keyPayload,
+					AuthTag:     authTag,
+				}, paddingCfg)
+				if err != nil {
+					errCh <- ErrProtocolError("failed to encode privacy shard").WithCause(err)
+					return
+				}
 				shardPayload := append([]byte{msgTypeData}, privacyShard...)
 				encryptedPayload, err := encryptOnion(shardPayload, circuits[idx], dest, hopKeys)
 				if err != nil {
@@ -1588,7 +1638,7 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 
 			// Apply per-stream write deadline (Req 8.2).
 			if stream, ok := m.circuitMgr.GetStream(circuitID); ok && stream != nil {
-				stream.Stream().SetDeadline(time.Now().Add(30 * time.Second))
+				stream.Stream().SetDeadline(time.Now().Add(configuredStreamTimeout(30 * time.Second)))
 			}
 
 			if err := m.circuitMgr.SendData(circuitID, fullData); err != nil {

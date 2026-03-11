@@ -1,0 +1,27 @@
+FROM golang:1.25.7-alpine
+
+WORKDIR /app
+
+# Install dependencies
+RUN apk add --no-cache ca-certificates git bash curl jq python3
+
+# Set Go environment
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/go"
+ENV PATH="${GOPATH}/bin:${PATH}"
+
+# Copy go.mod and go.sum first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the entire project
+COPY . .
+
+# Install benchmark dependencies
+RUN go install golang.org/x/perf/cmd/benchstat@latest
+
+# Create results directory
+RUN mkdir -p /app/mixnet/benchmarks/results
+
+# Default command (can be overridden)
+CMD ["sleep", "infinity"]

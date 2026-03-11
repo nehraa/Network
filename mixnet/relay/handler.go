@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,15 +29,12 @@ const (
 	// MaxPayloadSize is the maximum allowed size for a single packet.
 	MaxPayloadSize = 64 * 1024 // 64KB
 
-	// maxEncryptedPayloadSize is the maximum allowed size for an encrypted frame payload.
-	// The 4x multiplier accounts for encryption overhead and multi-hop wrapping.
-	maxEncryptedPayloadSize = MaxPayloadSize * 4
-
 	// ReadTimeout is the duration after which an inactive relay stream is closed.
 	ReadTimeout = 30 * time.Second
 
 	// nonceSize is the nonce size for ChaCha20-Poly1305 (12 bytes for standard, 24 for X)
-	nonceSize = 24 // XChaCha20-Poly1305
+	nonceSize      = 24 // XChaCha20-Poly1305
+	writeChunkSize = 32 * 1024
 
 	frameVersionFullOnion  byte = 0x01
 	frameVersionHeaderOnly byte = 0x02
@@ -46,6 +45,18 @@ const (
 	msgTypeCloseReq byte = 0x01
 	msgTypeCloseAck byte = 0x02
 )
+
+func MaxEncryptedPayloadSize() int {
+	const defaultMultiplier = 4
+
+	if raw := os.Getenv("MIXNET_MAX_ENCRYPTED_PAYLOAD"); raw != "" {
+		if size, err := strconv.Atoi(raw); err == nil && size > 0 {
+			return size
+		}
+	}
+
+	return MaxPayloadSize * defaultMultiplier
+}
 
 // RelayInfo contains runtime statistics and state for an active relay circuit on this node.
 type RelayInfo struct {
@@ -144,13 +155,27 @@ func (h *Handler) HandleStream(stream network.Stream) {
 		deadline := time.Now().Add(ReadTimeout)
 		_ = stream.SetDeadline(deadline)
 
-		circuitID, frameVersion, encPayload, releaseMem, err := readEncryptedFrame(reader, stream.Scope())
+		circuitID, frameVersion, payloadLen, err := readEncryptedFrameHeader(reader)
 		if err != nil {
 			return
 		}
 		frameCtx, cancel := context.WithDeadline(baseCtx, deadline)
 		err = func(ctx context.Context) error {
 			defer cancel()
+
+			key := h.getCircuitKey(circuitID)
+			if len(key) == 0 {
+				return fmt.Errorf("missing circuit key")
+			}
+
+			if frameVersion == frameVersionHeaderOnly {
+				return h.handleHeaderOnlyFrameStream(ctx, reader, circuitID, payloadLen, key, &dst, &dstPeer, &dstIsFinal, stream)
+			}
+
+			encPayload, releaseMem, err := readEncryptedFramePayload(reader, stream.Scope(), payloadLen)
+			if err != nil {
+				return err
+			}
 			if releaseMem != nil {
 				defer releaseMem()
 			}
@@ -158,16 +183,10 @@ func (h *Handler) HandleStream(stream network.Stream) {
 				h.recordBandwidth("in", int64(len(encPayload)))
 			}
 
-			key := h.getCircuitKey(circuitID)
-			if len(key) == 0 {
-				return fmt.Errorf("missing circuit key")
-			}
-
 			var (
 				isFinal     bool
 				nextHop     string
 				innerHeader []byte
-				dataPayload []byte
 			)
 
 			switch frameVersion {
@@ -183,23 +202,6 @@ func (h *Handler) HandleStream(stream network.Stream) {
 				isFinal = parsedFinal
 				nextHop = parsedHop
 				innerHeader = innerPayload
-			case frameVersionHeaderOnly:
-				encryptedHeader, payload, err := parseHeaderOnlyPayload(encPayload)
-				if err != nil {
-					return err
-				}
-				plaintext, err := decryptHopPayload(key, encryptedHeader)
-				if err != nil {
-					return err
-				}
-				parsedFinal, parsedHop, headerPayload, err := parseHopPayload(plaintext)
-				if err != nil {
-					return err
-				}
-				isFinal = parsedFinal
-				nextHop = parsedHop
-				innerHeader = headerPayload
-				dataPayload = payload
 			default:
 				return fmt.Errorf("unknown frame version: %d", frameVersion)
 			}
@@ -217,13 +219,7 @@ func (h *Handler) HandleStream(stream network.Stream) {
 					_ = dst.Close()
 					dst = nil
 				}
-				forwardPayload := innerHeader
-				forwardVersion := frameVersion
-				if frameVersion == frameVersionHeaderOnly {
-					forwardPayload = buildHeaderOnlyPayload(innerHeader, dataPayload)
-					forwardVersion = frameVersionHeaderOnly
-				}
-				return h.forwardByAddressEncrypted(ctx, nextHop, circuitID, forwardVersion, forwardPayload, nextProto)
+				return h.forwardByAddressEncrypted(ctx, nextHop, circuitID, frameVersion, innerHeader, nextProto)
 			}
 
 			// Keep per-circuit streams open; rotate only when route target/mode changes.
@@ -250,30 +246,11 @@ func (h *Handler) HandleStream(stream network.Stream) {
 			if maxBandwidth > 0 {
 				writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 			}
-			if waitBandwidth != nil {
-				targetLen := len(innerHeader)
-				if frameVersion == frameVersionHeaderOnly {
-					targetLen = len(dataPayload) + len(innerHeader)
-				}
-				if err := waitBandwidth(ctx, int64(targetLen)); err != nil {
-					return err
-				}
-			}
-
 			if isFinal {
-				finalPayload := innerHeader
-				if frameVersion == frameVersionHeaderOnly {
-					finalPayload = append([]byte{msgTypeData}, finalPayload...)
-					finalPayload = append(finalPayload, dataPayload...)
-				}
-				n, err := writer.Write(finalPayload)
-				if err != nil {
+				if _, err := writePayloadWithBandwidth(ctx, writer, innerHeader, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 					return err
 				}
-				if recordBandwidth != nil {
-					recordBandwidth("out", int64(n))
-				}
-				if len(finalPayload) > 0 && finalPayload[0] == msgTypeCloseReq {
+				if len(innerHeader) > 0 && innerHeader[0] == msgTypeCloseReq {
 					if err := waitForCloseAck(dst); err != nil {
 						return err
 					}
@@ -292,18 +269,8 @@ func (h *Handler) HandleStream(stream network.Stream) {
 					dst = nil
 				}
 			} else {
-				forwardPayload := innerHeader
-				forwardVersion := frameVersion
-				if frameVersion == frameVersionHeaderOnly {
-					forwardPayload = buildHeaderOnlyPayload(innerHeader, dataPayload)
-					forwardVersion = frameVersionHeaderOnly
-				}
-				n, err := writeEncryptedFrame(writer, circuitID, forwardVersion, forwardPayload)
-				if err != nil {
+				if _, err := writeEncryptedFrame(ctx, writer, circuitID, frameVersion, innerHeader, waitBandwidth, recordBandwidth); err != nil {
 					return err
-				}
-				if recordBandwidth != nil {
-					recordBandwidth("out", int64(n))
 				}
 			}
 
@@ -316,6 +283,110 @@ func (h *Handler) HandleStream(stream network.Stream) {
 			return
 		}
 	}
+}
+
+func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio.Reader, circuitID string, payloadLen int, key []byte, dst *network.Stream, dstPeer *peer.ID, dstIsFinal *bool, src network.Stream) error {
+	h.mu.RLock()
+	recordBandwidth := h.recordBandwidth
+	waitBandwidth := h.waitBandwidth
+	maxBandwidth := h.maxBandwidth
+	h.mu.RUnlock()
+
+	if payloadLen < 4 {
+		return fmt.Errorf("header-only payload too short")
+	}
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(reader, lenBuf); err != nil {
+		return err
+	}
+	if recordBandwidth != nil {
+		recordBandwidth("in", 4)
+	}
+	headerLen := int(binary.LittleEndian.Uint32(lenBuf))
+	if headerLen <= 0 || payloadLen < 4+headerLen {
+		return fmt.Errorf("invalid header length")
+	}
+	encryptedHeader := make([]byte, headerLen)
+	if _, err := io.ReadFull(reader, encryptedHeader); err != nil {
+		return err
+	}
+	if recordBandwidth != nil {
+		recordBandwidth("in", int64(headerLen))
+	}
+	plaintext, err := decryptHopPayload(key, encryptedHeader)
+	if err != nil {
+		return err
+	}
+	isFinal, nextHop, innerHeader, err := parseHopPayload(plaintext)
+	if err != nil {
+		return err
+	}
+	dataPayloadLen := payloadLen - 4 - headerLen
+
+	nextProto := ProtocolID
+	if isFinal {
+		nextProto = FinalProtocolID
+	}
+
+	nextPeerDecoded, err := peer.Decode(nextHop)
+	if err != nil {
+		if *dst != nil {
+			_ = (*dst).Close()
+			*dst = nil
+		}
+		return h.forwardByAddressHeaderOnlyStreaming(ctx, reader, nextHop, circuitID, innerHeader, dataPayloadLen, nextProto, waitBandwidth, recordBandwidth, maxBandwidth)
+	}
+
+	if *dst == nil || *dstPeer != nextPeerDecoded || *dstIsFinal != isFinal {
+		if *dst != nil {
+			_ = (*dst).Close()
+		}
+		s, err := h.openStream(ctx, nextPeerDecoded, nextProto)
+		if err != nil {
+			return err
+		}
+		*dst = s
+		*dstPeer = nextPeerDecoded
+		*dstIsFinal = isFinal
+	}
+
+	var writer io.Writer = *dst
+	if maxBandwidth > 0 {
+		writer = &rateLimitedWriter{w: *dst, bytesPerSec: maxBandwidth}
+	}
+	if isFinal {
+		if _, err := writePayloadWithBandwidth(ctx, writer, []byte{msgTypeData}, 1, waitBandwidth, recordBandwidth); err != nil {
+			return err
+		}
+		if _, err := writePayloadWithBandwidth(ctx, writer, innerHeader, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
+			return err
+		}
+		if _, err := pipePayloadWithBandwidth(ctx, reader, writer, dataPayloadLen, waitBandwidth, recordBandwidth); err != nil {
+			return err
+		}
+		if len(innerHeader) > 0 && innerHeader[0] == msgTypeCloseReq {
+			if err := waitForCloseAck(*dst); err != nil {
+				return err
+			}
+			if _, err := src.Write([]byte{msgTypeCloseAck}); err != nil {
+				return err
+			}
+			_ = (*dst).Close()
+			*dst = nil
+			return io.EOF
+		}
+		if *dst != nil {
+			_ = (*dst).Close()
+			*dst = nil
+		}
+		return nil
+	}
+
+	if _, err := writeHeaderOnlyFramePrefix(ctx, writer, circuitID, innerHeader, dataPayloadLen, waitBandwidth, recordBandwidth); err != nil {
+		return err
+	}
+	_, err = pipePayloadWithBandwidth(ctx, reader, writer, dataPayloadLen, waitBandwidth, recordBandwidth)
+	return err
 }
 
 func (h *Handler) openStream(ctx context.Context, nextPeer peer.ID, protoID string) (network.Stream, error) {
@@ -356,6 +427,12 @@ func (h *Handler) openStream(ctx context.Context, nextPeer peer.ID, protoID stri
 	if err != nil {
 		return nil, err
 	}
+	if flusher, ok := s.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = s.Reset()
+			return nil, fmt.Errorf("failed to negotiate stream: %w", err)
+		}
+	}
 	// Tag the stream's own scope with service so resource policies are enforced correctly.
 	if useRCMgr {
 		_ = s.Scope().SetService(serviceName)
@@ -391,6 +468,12 @@ func (h *Handler) forwardByAddressEncrypted(ctx context.Context, addr string, ci
 		return fmt.Errorf("failed to open stream: %w", err)
 	}
 	defer dst.Close()
+	if flusher, ok := dst.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = dst.Reset()
+			return fmt.Errorf("failed to negotiate stream: %w", err)
+		}
+	}
 
 	var writer io.Writer = dst
 	if maxBandwidth > 0 {
@@ -402,14 +485,95 @@ func (h *Handler) forwardByAddressEncrypted(ctx context.Context, addr string, ci
 		}
 	}
 
-	n, err := writeEncryptedFrame(writer, circuitID, version, payload)
+	_, err = writeEncryptedFrame(ctx, writer, circuitID, version, payload, waitBandwidth, recordBandwidth)
+	return err
+}
+
+func (h *Handler) forwardByAddressHeaderOnlyEncrypted(ctx context.Context, addr string, circuitID string, encryptedHeader []byte, dataPayload []byte, protoID string) error {
+	h.mu.RLock()
+	host := h.host
+	maxBandwidth := h.maxBandwidth
+	waitBandwidth := h.waitBandwidth
+	recordBandwidth := h.recordBandwidth
+	h.mu.RUnlock()
+
+	if host == nil {
+		return fmt.Errorf("no host configured")
+	}
+
+	addrInfo, err := peer.AddrInfoFromString(addr)
 	if err != nil {
+		return fmt.Errorf("failed to parse address: %w", err)
+	}
+
+	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := host.Connect(connectCtx, *addrInfo); err != nil {
+		return fmt.Errorf("failed to connect to %s: %w", addr, err)
+	}
+
+	dst, err := host.NewStream(ctx, addrInfo.ID, protocol.ID(protoID))
+	if err != nil {
+		return fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer dst.Close()
+	if flusher, ok := dst.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = dst.Reset()
+			return fmt.Errorf("failed to negotiate stream: %w", err)
+		}
+	}
+
+	var writer io.Writer = dst
+	if maxBandwidth > 0 {
+		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
+	}
+
+	_, err = writeHeaderOnlyFrame(ctx, writer, circuitID, encryptedHeader, dataPayload, waitBandwidth, recordBandwidth)
+	return err
+}
+
+func (h *Handler) forwardByAddressHeaderOnlyStreaming(ctx context.Context, reader *bufio.Reader, addr string, circuitID string, encryptedHeader []byte, dataPayloadLen int, protoID string, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64), maxBandwidth int64) error {
+	h.mu.RLock()
+	host := h.host
+	h.mu.RUnlock()
+
+	if host == nil {
+		return fmt.Errorf("no host configured")
+	}
+
+	addrInfo, err := peer.AddrInfoFromString(addr)
+	if err != nil {
+		return fmt.Errorf("failed to parse address: %w", err)
+	}
+
+	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := host.Connect(connectCtx, *addrInfo); err != nil {
+		return fmt.Errorf("failed to connect to %s: %w", addr, err)
+	}
+
+	dst, err := host.NewStream(ctx, addrInfo.ID, protocol.ID(protoID))
+	if err != nil {
+		return fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer dst.Close()
+	if flusher, ok := dst.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = dst.Reset()
+			return fmt.Errorf("failed to negotiate stream: %w", err)
+		}
+	}
+
+	var writer io.Writer = dst
+	if maxBandwidth > 0 {
+		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
+	}
+	if _, err := writeHeaderOnlyFramePrefix(ctx, writer, circuitID, encryptedHeader, dataPayloadLen, waitBandwidth, recordBandwidth); err != nil {
 		return err
 	}
-	if recordBandwidth != nil {
-		recordBandwidth("out", int64(n))
-	}
-	return nil
+	_, err = pipePayloadWithBandwidth(ctx, reader, writer, dataPayloadLen, waitBandwidth, recordBandwidth)
+	return err
 }
 
 func waitForCloseAck(stream network.Stream) error {
@@ -424,35 +588,39 @@ func waitForCloseAck(stream network.Stream) error {
 	return nil
 }
 
-func readEncryptedFrame(r *bufio.Reader, scope network.StreamScope) (string, byte, []byte, func(), error) {
+func readEncryptedFrameHeader(r *bufio.Reader) (string, byte, int, error) {
 	cidLen, err := r.ReadByte()
 	if err != nil {
-		return "", 0, nil, nil, err
+		return "", 0, 0, err
 	}
 	if cidLen == 0 {
-		return "", 0, nil, nil, fmt.Errorf("empty circuit id")
+		return "", 0, 0, fmt.Errorf("empty circuit id")
 	}
 	cid := make([]byte, int(cidLen))
 	if _, err := io.ReadFull(r, cid); err != nil {
-		return "", 0, nil, nil, err
+		return "", 0, 0, err
 	}
 	version, err := r.ReadByte()
 	if err != nil {
-		return "", 0, nil, nil, err
+		return "", 0, 0, err
 	}
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return "", 0, nil, nil, err
+		return "", 0, 0, err
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(lenBuf))
-	if payloadLen <= 0 || payloadLen > maxEncryptedPayloadSize {
-		return "", 0, nil, nil, fmt.Errorf("invalid encrypted payload length")
+	maxPayloadSize := MaxEncryptedPayloadSize()
+	if payloadLen <= 0 || payloadLen > maxPayloadSize {
+		return "", 0, 0, fmt.Errorf("invalid encrypted payload length")
 	}
+	return string(cid), version, payloadLen, nil
+}
 
+func readEncryptedFramePayload(r *bufio.Reader, scope network.StreamScope, payloadLen int) ([]byte, func(), error) {
 	release := func() {}
 	if scope != nil {
 		if err := scope.ReserveMemory(payloadLen, network.ReservationPriorityMedium); err != nil {
-			return "", 0, nil, nil, fmt.Errorf("rcmgr inbound memory reservation failed: %w", err)
+			return nil, nil, fmt.Errorf("rcmgr inbound memory reservation failed: %w", err)
 		}
 		release = func() { scope.ReleaseMemory(payloadLen) }
 	}
@@ -460,29 +628,187 @@ func readEncryptedFrame(r *bufio.Reader, scope network.StreamScope) (string, byt
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		release()
-		return "", 0, nil, nil, err
+		return nil, nil, err
 	}
-	return string(cid), version, payload, release, nil
+	return payload, release, nil
 }
 
-func writeEncryptedFrame(w io.Writer, circuitID string, version byte, payload []byte) (int, error) {
+func writeEncryptedFrame(ctx context.Context, w io.Writer, circuitID string, version byte, payload []byte, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
 	if len(circuitID) == 0 || len(circuitID) > 255 {
 		return 0, fmt.Errorf("invalid circuit id")
 	}
-	if len(payload) > maxEncryptedPayloadSize {
-		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", len(payload), maxEncryptedPayloadSize)
+	maxPayloadSize := MaxEncryptedPayloadSize()
+	if len(payload) > maxPayloadSize {
+		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", len(payload), maxPayloadSize)
 	}
 	header := make([]byte, 1+len(circuitID)+1+4)
 	header[0] = byte(len(circuitID))
 	copy(header[1:], []byte(circuitID))
 	header[1+len(circuitID)] = version
 	binary.LittleEndian.PutUint32(header[1+len(circuitID)+1:], uint32(len(payload)))
-	hn, err := w.Write(header)
+	hn, err := writePayloadWithBandwidth(ctx, w, header, len(header), waitBandwidth, recordBandwidth)
 	if err != nil {
 		return hn, err
 	}
-	pn, err := w.Write(payload)
+	pn, err := writePayloadWithBandwidth(ctx, w, payload, writeChunkSize, waitBandwidth, recordBandwidth)
 	return hn + pn, err
+}
+
+func writeHeaderOnlyFrame(ctx context.Context, w io.Writer, circuitID string, encryptedHeader []byte, dataPayload []byte, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
+	if len(circuitID) == 0 || len(circuitID) > 255 {
+		return 0, fmt.Errorf("invalid circuit id")
+	}
+	if len(encryptedHeader) == 0 {
+		return 0, fmt.Errorf("missing header-only header")
+	}
+	payloadLen := 4 + len(encryptedHeader) + len(dataPayload)
+	maxPayloadSize := MaxEncryptedPayloadSize()
+	if payloadLen > maxPayloadSize {
+		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", payloadLen, maxPayloadSize)
+	}
+
+	total, err := writeHeaderOnlyFramePrefix(ctx, w, circuitID, encryptedHeader, len(dataPayload), waitBandwidth, recordBandwidth)
+	if err != nil {
+		return total, err
+	}
+	n, err := writePayloadWithBandwidth(ctx, w, dataPayload, writeChunkSize, waitBandwidth, recordBandwidth)
+	total += n
+	return total, err
+}
+
+func writeHeaderOnlyFramePrefix(ctx context.Context, w io.Writer, circuitID string, encryptedHeader []byte, dataPayloadLen int, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
+	if len(circuitID) == 0 || len(circuitID) > 255 {
+		return 0, fmt.Errorf("invalid circuit id")
+	}
+	if len(encryptedHeader) == 0 {
+		return 0, fmt.Errorf("missing header-only header")
+	}
+	payloadLen := 4 + len(encryptedHeader) + dataPayloadLen
+	maxPayloadSize := MaxEncryptedPayloadSize()
+	if payloadLen > maxPayloadSize {
+		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", payloadLen, maxPayloadSize)
+	}
+
+	frameHeader := make([]byte, 1+len(circuitID)+1+4)
+	frameHeader[0] = byte(len(circuitID))
+	copy(frameHeader[1:], []byte(circuitID))
+	frameHeader[1+len(circuitID)] = frameVersionHeaderOnly
+	binary.LittleEndian.PutUint32(frameHeader[1+len(circuitID)+1:], uint32(payloadLen))
+
+	headerOnlyPrefix := make([]byte, 4)
+	binary.LittleEndian.PutUint32(headerOnlyPrefix, uint32(len(encryptedHeader)))
+
+	total, err := writePayloadWithBandwidth(ctx, w, frameHeader, len(frameHeader), waitBandwidth, recordBandwidth)
+	if err != nil {
+		return total, err
+	}
+	n, err := writePayloadWithBandwidth(ctx, w, headerOnlyPrefix, len(headerOnlyPrefix), waitBandwidth, recordBandwidth)
+	total += n
+	if err != nil {
+		return total, err
+	}
+	n, err = writePayloadWithBandwidth(ctx, w, encryptedHeader, writeChunkSize, waitBandwidth, recordBandwidth)
+	total += n
+	return total, err
+}
+
+func writeHeaderOnlyFinalPayload(ctx context.Context, w io.Writer, controlHeader []byte, dataPayload []byte, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
+	total, err := writePayloadWithBandwidth(ctx, w, []byte{msgTypeData}, 1, waitBandwidth, recordBandwidth)
+	if err != nil {
+		return total, err
+	}
+	n, err := writePayloadWithBandwidth(ctx, w, controlHeader, writeChunkSize, waitBandwidth, recordBandwidth)
+	total += n
+	if err != nil {
+		return total, err
+	}
+	n, err = writePayloadWithBandwidth(ctx, w, dataPayload, writeChunkSize, waitBandwidth, recordBandwidth)
+	total += n
+	return total, err
+}
+
+func pipePayloadWithBandwidth(ctx context.Context, r *bufio.Reader, w io.Writer, remaining int, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
+	if remaining < 0 {
+		return 0, fmt.Errorf("invalid payload length")
+	}
+	buf := make([]byte, writeChunkSize)
+	total := 0
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+		chunkLen := remaining
+		if chunkLen > len(buf) {
+			chunkLen = len(buf)
+		}
+		n, err := io.ReadFull(r, buf[:chunkLen])
+		if n > 0 && recordBandwidth != nil {
+			recordBandwidth("in", int64(n))
+		}
+		if err != nil {
+			return total, err
+		}
+		written, err := writePayloadWithBandwidth(ctx, w, buf[:n], n, waitBandwidth, recordBandwidth)
+		total += written
+		if err != nil {
+			return total, err
+		}
+		remaining -= n
+	}
+	return total, nil
+}
+
+func writePayloadWithBandwidth(ctx context.Context, w io.Writer, payload []byte, chunkSize int, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
+	total := 0
+	for len(payload) > 0 {
+		chunk := payload
+		if chunkSize > 0 && len(chunk) > chunkSize {
+			chunk = chunk[:chunkSize]
+		}
+		if waitBandwidth != nil {
+			if err := waitBandwidth(ctx, int64(len(chunk))); err != nil {
+				return total, err
+			}
+		}
+		n, err := w.Write(chunk)
+		total += n
+		if n > 0 && recordBandwidth != nil {
+			recordBandwidth("out", int64(n))
+		}
+		if err != nil {
+			return total, err
+		}
+		if n <= 0 {
+			return total, fmt.Errorf("short write")
+		}
+		payload = payload[n:]
+	}
+	return total, nil
+}
+
+func writeAllChunked(w io.Writer, payload []byte, chunkSize int) (int, error) {
+	if chunkSize <= 0 {
+		chunkSize = len(payload)
+	}
+	total := 0
+	for len(payload) > 0 {
+		chunk := payload
+		if len(chunk) > chunkSize {
+			chunk = chunk[:chunkSize]
+		}
+		n, err := w.Write(chunk)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n <= 0 {
+			return total, fmt.Errorf("short write")
+		}
+		payload = payload[n:]
+	}
+	return total, nil
 }
 
 func decryptHopPayload(key []byte, payload []byte) ([]byte, error) {
@@ -583,6 +909,13 @@ func (h *Handler) MaxCircuits() int {
 // MaxBandwidth returns the maximum bandwidth allowed per circuit.
 func (h *Handler) MaxBandwidth() int64 {
 	return h.maxBandwidth
+}
+
+// SetMaxBandwidth updates the per-circuit bandwidth limit used by the relay handler.
+func (h *Handler) SetMaxBandwidth(maxBandwidth int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.maxBandwidth = maxBandwidth
 }
 
 // ActiveCircuitCount returns the current number of active relay circuits.

@@ -27,7 +27,20 @@ type Sharder struct {
 // totalShards is the total number of shards produced (data + parity).
 // threshold is the minimum number of shards required for reconstruction.
 func NewSharder(totalShards, threshold int) *Sharder {
-	if threshold < 1 || threshold >= totalShards {
+	if threshold < 1 || threshold > totalShards {
+		return &Sharder{
+			totalShards: totalShards,
+			threshold:   threshold,
+			initErr:     fmt.Errorf("invalid sharder params: totalShards=%d threshold=%d", totalShards, threshold),
+		}
+	}
+	if totalShards == 1 && threshold == 1 {
+		return &Sharder{
+			totalShards: totalShards,
+			threshold:   threshold,
+		}
+	}
+	if threshold == totalShards {
 		return &Sharder{
 			totalShards: totalShards,
 			threshold:   threshold,
@@ -59,6 +72,12 @@ func (s *Sharder) Shard(data []byte) ([]*Shard, error) {
 		return nil, s.initErr
 	}
 	dataShards := s.threshold
+	if s.totalShards == 1 && s.threshold == 1 {
+		payload := make([]byte, 8+len(data))
+		binary.LittleEndian.PutUint64(payload[:8], uint64(len(data)))
+		copy(payload[8:], data)
+		return []*Shard{{Index: 0, Data: payload}}, nil
+	}
 
 	// Prepend 8-byte original data length so we can trim padding on reconstruction.
 	origLen := uint64(len(data))
@@ -107,6 +126,21 @@ func (s *Sharder) Reconstruct(shards []*Shard) ([]byte, error) {
 	}
 	if len(shards) < s.threshold {
 		return nil, fmt.Errorf("insufficient shards: have %d, need %d", len(shards), s.threshold)
+	}
+	if s.totalShards == 1 && s.threshold == 1 {
+		if len(shards) == 0 || shards[0] == nil {
+			return nil, fmt.Errorf("missing single shard")
+		}
+		combined := shards[0].Data
+		if len(combined) < 8 {
+			return nil, fmt.Errorf("reconstructed data too short to contain length prefix")
+		}
+		origLen := binary.LittleEndian.Uint64(combined[:8])
+		payload := combined[8:]
+		if uint64(len(payload)) < origLen {
+			return nil, fmt.Errorf("reconstructed payload shorter than expected: got %d, want %d", len(payload), origLen)
+		}
+		return payload[:origLen], nil
 	}
 
 	// Place provided shards into a full-length slice (nil = missing).
