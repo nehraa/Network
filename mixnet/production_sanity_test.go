@@ -97,6 +97,9 @@ func TestProductionSanity(t *testing.T) {
 		if err := cfg.SetUseCESPipeline(false); err != nil {
 			t.Fatalf("set ces: %v", err)
 		}
+		if err := cfg.SetUseCSE(true); err != nil {
+			t.Fatalf("set CSE: %v", err)
+		}
 		if err := cfg.SetHeaderPadding(true, 8, 32); err != nil {
 			t.Fatalf("set header padding: %v", err)
 		}
@@ -124,6 +127,9 @@ func TestProductionSanity(t *testing.T) {
 		cfg.MaxJitter = 0
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("validate: %v", err)
+		}
+		if !cfg.UseCSE {
+			t.Fatal("expected CSE flag to be enabled")
 		}
 		if got := cfg.GetErasureThreshold(); got != cfg.CircuitCount {
 			t.Fatalf("non-CES threshold mismatch: got %d want %d", got, cfg.CircuitCount)
@@ -1006,7 +1012,7 @@ func TestProductionSanity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode control header: %v", err)
 			}
-			body := []byte("header-only-body")
+			body := bytes.Repeat([]byte("header-only-stream-body-"), 1<<11)
 			onionHeader, err := encryptOnionHeader(controlHeader, c, destination.ID(), hopKeys)
 			if err != nil {
 				t.Fatalf("encrypt onion header: %v", err)
@@ -1185,6 +1191,37 @@ func TestProductionSanity(t *testing.T) {
 			wait("", payload)
 		})
 
+		t.Run("non-ces cse send", func(t *testing.T) {
+			cfg := &MixnetConfig{
+				HopCount:               1,
+				CircuitCount:           3,
+				Compression:            "gzip",
+				UseCESPipeline:         false,
+				UseCSE:                 true,
+				EncryptionMode:         EncryptionModeFull,
+				HeaderPaddingEnabled:   false,
+				PayloadPaddingStrategy: PaddingStrategyNone,
+				EnableAuthTag:          true,
+				AuthTagSize:            16,
+				SelectionMode:          SelectionModeRandom,
+				SamplingSize:           9,
+				RandomnessFactor:       0.3,
+				MaxJitter:              0,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+
+			origin, dest, _, cleanup := setupMixnetNetwork(t, ctx, cfg, 9)
+			defer cleanup()
+
+			wait := expectInboundPayload(t, ctx, dest)
+			payload := bytes.Repeat([]byte("cse-fast-path-"), 4096)
+			if err := origin.Send(ctx, dest.Host().ID(), payload); err != nil {
+				t.Fatalf("non-CES CSE send: %v", err)
+			}
+			wait("", payload)
+		})
+
 		cfg := &MixnetConfig{
 			HopCount:               1,
 			CircuitCount:           3,
@@ -1359,16 +1396,17 @@ func TestProductionSanity(t *testing.T) {
 
 			postRecoveryCtx, postRecoveryCancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer postRecoveryCancel()
+			postRecoverySessionID := "post-recovery-session"
 			delivered := make(chan struct{}, 1)
 			go func() {
-				expectInboundPayload(t, postRecoveryCtx, dest)("", []byte("after-recovery"))
+				expectInboundPayload(t, postRecoveryCtx, dest)(postRecoverySessionID, []byte("after-recovery"))
 				delivered <- struct{}{}
 			}()
 			ticker := time.NewTicker(750 * time.Millisecond)
 			defer ticker.Stop()
 			graceUntil := time.Now().Add(5 * time.Second)
 			for {
-				if err := origin.Send(postRecoveryCtx, dest.Host().ID(), []byte("after-recovery")); err != nil && postRecoveryCtx.Err() == nil {
+				if err := origin.SendWithSession(postRecoveryCtx, dest.Host().ID(), []byte("after-recovery"), postRecoverySessionID); err != nil && postRecoveryCtx.Err() == nil {
 					if time.Now().After(graceUntil) {
 						t.Fatalf("send after recovery: %v", err)
 					}
@@ -1707,11 +1745,11 @@ func TestProductionSanity(t *testing.T) {
 	runStep("destination handler and reschedule edges", func(t *testing.T) {
 		h := &DestinationHandler{
 			pipeline:        nil,
-			shardBuf:        make(map[string][]*ces.Shard),
+			shardBuf:        make(map[string]map[int]*ces.Shard),
 			shardTags:       make(map[string]map[int][]byte),
 			totalShards:     make(map[string]int),
 			timers:          make(map[string]*time.Timer),
-			sessions:        make(map[string]chan []byte),
+			sessions:        make(map[string]*sessionMailbox),
 			keys:            make(map[string]sessionKey),
 			keyData:         make(map[string][]byte),
 			inboundCh:       make(chan string, 1),
@@ -1726,7 +1764,9 @@ func TestProductionSanity(t *testing.T) {
 
 		sessionID := "s1"
 		h.ensureSession(sessionID)
-		h.AddShard(sessionID, &ces.Shard{Index: 0, Data: []byte("x")}, []byte("short"), []byte("tag"), 1)
+		if err := h.AddShard(sessionID, &ces.Shard{Index: 0, Data: []byte("x")}, []byte("short"), []byte("tag"), 1); err != nil {
+			t.Fatalf("add shard: %v", err)
+		}
 		time.Sleep(30 * time.Millisecond)
 		h.mu.Lock()
 		_, ok := h.sessions[sessionID]
@@ -1739,11 +1779,11 @@ func TestProductionSanity(t *testing.T) {
 		encKey := encodeSessionKeyData(key)
 		h2 := &DestinationHandler{
 			pipeline:        nil,
-			shardBuf:        make(map[string][]*ces.Shard),
+			shardBuf:        make(map[string]map[int]*ces.Shard),
 			shardTags:       make(map[string]map[int][]byte),
 			totalShards:     make(map[string]int),
 			timers:          make(map[string]*time.Timer),
-			sessions:        make(map[string]chan []byte),
+			sessions:        make(map[string]*sessionMailbox),
 			keys:            map[string]sessionKey{sessionID: key},
 			keyData:         map[string][]byte{sessionID: encKey},
 			inboundCh:       make(chan string, 1),
@@ -1755,7 +1795,7 @@ func TestProductionSanity(t *testing.T) {
 			authEnabled:     true,
 			authTagSize:     16,
 		}
-		shards := []*ces.Shard{{Index: 0, Data: []byte("payload")}}
+		shards := map[int]*ces.Shard{0: &ces.Shard{Index: 0, Data: []byte("payload")}}
 		if err := h2.verifyAuthTags(sessionID, shards, 1, key); err == nil {
 			t.Fatal("expected missing auth tags error")
 		}
@@ -1775,11 +1815,11 @@ func TestProductionSanity(t *testing.T) {
 		}
 		h3 := &DestinationHandler{
 			pipeline:        nil,
-			shardBuf:        map[string][]*ces.Shard{sessionID: []*ces.Shard{{Index: 0, Data: cipher}}},
+			shardBuf:        map[string]map[int]*ces.Shard{sessionID: map[int]*ces.Shard{0: &ces.Shard{Index: 0, Data: cipher}}},
 			shardTags:       make(map[string]map[int][]byte),
 			totalShards:     map[string]int{sessionID: 1},
 			timers:          make(map[string]*time.Timer),
-			sessions:        map[string]chan []byte{sessionID: make(chan []byte, 1)},
+			sessions:        map[string]*sessionMailbox{sessionID: {ch: make(chan []byte, 1)}},
 			keys:            map[string]sessionKey{sessionID: key},
 			keyData:         map[string][]byte{sessionID: keyData},
 			inboundCh:       make(chan string, 1),

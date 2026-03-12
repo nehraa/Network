@@ -34,11 +34,18 @@ const (
 
 	// nonceSize is the nonce size for ChaCha20-Poly1305 (12 bytes for standard, 24 for X)
 	nonceSize      = 24 // XChaCha20-Poly1305
-	writeChunkSize = 32 * 1024
+	writeChunkSize = 256 * 1024
 
 	frameVersionFullOnion  byte = 0x01
 	frameVersionHeaderOnly byte = 0x02
 )
+
+var relayChunkPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, writeChunkSize)
+		return &buf
+	},
+}
 
 const (
 	msgTypeData     byte = 0x00
@@ -168,6 +175,9 @@ func (h *Handler) HandleStream(stream network.Stream) {
 				return fmt.Errorf("missing circuit key")
 			}
 
+			// Header-only frames are handled in a dedicated streaming path so the
+			// relay only decrypts the onion header and forwards the remaining
+			// payload bytes without rebuilding a full [header][payload] buffer.
 			if frameVersion == frameVersionHeaderOnly {
 				return h.handleHeaderOnlyFrameStream(ctx, reader, circuitID, payloadLen, key, &dst, &dstPeer, &dstIsFinal, stream)
 			}
@@ -285,6 +295,11 @@ func (h *Handler) HandleStream(stream network.Stream) {
 	}
 }
 
+// handleHeaderOnlyFrameStream implements the header-only fast path.
+//
+// It reads and decrypts only the encrypted onion header, learns the next hop,
+// and then streams the remaining payload bytes onward. The payload itself is
+// never reassembled into a new full-size buffer at intermediate relays.
 func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio.Reader, circuitID string, payloadLen int, key []byte, dst *network.Stream, dstPeer *peer.ID, dstIsFinal *bool, src network.Stream) error {
 	h.mu.RLock()
 	recordBandwidth := h.recordBandwidth
@@ -295,14 +310,14 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 	if payloadLen < 4 {
 		return fmt.Errorf("header-only payload too short")
 	}
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(reader, lenBuf); err != nil {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
 		return err
 	}
 	if recordBandwidth != nil {
 		recordBandwidth("in", 4)
 	}
-	headerLen := int(binary.LittleEndian.Uint32(lenBuf))
+	headerLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 	if headerLen <= 0 || payloadLen < 4+headerLen {
 		return fmt.Errorf("invalid header length")
 	}
@@ -355,6 +370,9 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 		writer = &rateLimitedWriter{w: *dst, bytesPerSec: maxBandwidth}
 	}
 	if isFinal {
+		// At the destination-facing hop we still prepend the control header, but
+		// the data payload is streamed from the inbound relay stream directly into
+		// the final stream instead of being copied into a new combined buffer.
 		if _, err := writePayloadWithBandwidth(ctx, writer, []byte{msgTypeData}, 1, waitBandwidth, recordBandwidth); err != nil {
 			return err
 		}
@@ -382,6 +400,8 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 		return nil
 	}
 
+	// For non-final hops write the updated frame prefix and then pipe the raw
+	// payload bytes through without re-encoding or copying the full shard.
 	if _, err := writeHeaderOnlyFramePrefix(ctx, writer, circuitID, innerHeader, dataPayloadLen, waitBandwidth, recordBandwidth); err != nil {
 		return err
 	}
@@ -727,11 +747,17 @@ func writeHeaderOnlyFinalPayload(ctx context.Context, w io.Writer, controlHeader
 	return total, err
 }
 
+// pipePayloadWithBandwidth copies payload bytes from the inbound relay stream
+// to the outbound stream in fixed-size chunks. It exists specifically to avoid
+// allocating or rebuilding a second full payload buffer when header-only onion
+// forwarding only needs to change the routing header.
 func pipePayloadWithBandwidth(ctx context.Context, r *bufio.Reader, w io.Writer, remaining int, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
 	if remaining < 0 {
 		return 0, fmt.Errorf("invalid payload length")
 	}
-	buf := make([]byte, writeChunkSize)
+	bufPtr := relayChunkPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer relayChunkPool.Put(bufPtr)
 	total := 0
 	for remaining > 0 {
 		select {

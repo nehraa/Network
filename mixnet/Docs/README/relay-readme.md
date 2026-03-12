@@ -8,6 +8,21 @@ The relay package implements the functionality for a libp2p node to act as a rel
 - **Resource Management**: Limits the number of active circuits and bandwidth used by the relay to prevent exhaustion.
 - **Zero Knowledge**: Relays do not know the Origin (except for the entry relay) or the Destination (except for the exit relay). They never see the unencrypted content.
 
+## Header-only forwarding model
+
+The relay has two forwarding behaviors depending on the configured encryption
+mode:
+
+- **Full onion**: the relay decrypts one hop layer for the full framed payload,
+  learns the next hop, and forwards the resulting inner frame.
+- **Header-only**: the relay decrypts only the onion header that contains the
+  next-hop routing information, rewrites only that header portion, and streams
+  the remaining payload bytes onward.
+
+In header-only mode the relay does not allocate and rebuild a second full copy
+of the shard payload at each hop. The only place that buffers and reconstructs
+the full session payload is the destination-side handler.
+
 ## Operating a Relay
 
 To operate a relay, a node simply needs to register the Lib-Mix protocol handler and advertise its capability in the DHT.

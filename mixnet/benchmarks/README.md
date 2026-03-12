@@ -16,14 +16,33 @@ This benchmark suite runs entirely on local libp2p hosts. It does not use Docker
 - Relay selection mode comparisons.
 - Key-exchange cost as a separate timing column in the summary output.
 
+## Header-only benchmark interpretation
+
+The benchmarked header-only path reflects the current relay implementation:
+
+- relays decrypt only the onion header needed for routing
+- relays stream payload bytes onward instead of rebuilding a fresh full payload
+  copy at every hop
+- the destination still buffers/reassembles the final session payload before it
+  is delivered to the benchmark reader
+
+That means the header-only numbers include end-to-end session crypto and
+destination reconstruction, but they no longer include repeated relay-side
+payload-copy overhead that existed in the older buffered forwarding path.
+
 ## Raw data and outlier rule
 
 Each scenario and data size is run multiple times.
 
+- Quick profile: 12 runs.
 - Full profile: 6 runs.
 - Smoke profile: 3 runs.
 - Raw files keep every run.
-- The aggregator excludes the single run farthest from the median total latency for that scenario and size.
+- The aggregator trims the runs farthest from the median total latency before
+  computing the summary. With the current defaults that means:
+  - quick keeps 10 of 12 runs
+  - full keeps 5 of 6 runs
+  - smoke keeps 2 of 3 runs
 - Means and sample standard deviations are computed from the remaining runs.
 
 ## Default size sweep
@@ -40,10 +59,10 @@ Full sweep:
 ./mixnet/run_local_benchmarks.sh
 ```
 
-Quick smoke validation:
+Quick focused sweep:
 
 ```bash
-MIXNET_BENCH_PROFILE=smoke ./mixnet/run_local_benchmarks.sh
+./mixnet/run_local_benchmarks.sh quick --timeout 10m
 ```
 
 Targeted run:

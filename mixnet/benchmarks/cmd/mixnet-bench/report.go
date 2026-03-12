@@ -76,13 +76,11 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	}
 
 	if opts.Profile == "quick" {
-		if err := addChart("Quick profile: direct vs header-only vs full onion", "graphs/quick_latency.svg", "Mean total latency (ms)",
+		if err := addChart("Quick profile: baseline vs header-only vs full onion (2 hops, 1 circuit)", "graphs/quick_c1_latency.svg", "Mean total latency (ms)",
 			[]chartSeries{
 				rawChartSeries("Direct baseline", "#1f77b4", lookup, "focused-direct-baseline"),
 				rawChartSeries("Header-only 2 hops 1 circuit", "#ff7f0e", lookup, "focused-header-only-c1"),
 				rawChartSeries("Full onion 2 hops 1 circuit", "#d62728", lookup, "focused-full-c1"),
-				rawChartSeries("Header-only 2 hops 3 circuits", "#2ca02c", lookup, "focused-header-only-c3"),
-				rawChartSeries("Full onion 2 hops 3 circuits", "#9467bd", lookup, "focused-full-c3"),
 			},
 			func(summary summaryRecord) float64 { return summary.TotalMeanMS },
 		); err != nil {
@@ -96,7 +94,7 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	}
 	data := reportData{
 		Profile:     opts.Profile,
-		Outlier:     fmt.Sprintf("For each scenario and size, %d raw runs are recorded and the benchmark applies this trim rule before computing averages and standard deviation: %s.", opts.Runs, describeOutlierRule(opts.Runs)),
+		Outlier:     fmt.Sprintf("For each scenario and size, %d raw runs are recorded and the benchmark applies this trim rule before computing averages and standard deviation: %s.", opts.Runs, describeOutlierRuleWithOverrides(opts.Runs, opts.SizeRunOverrides)),
 		Adjustment:  adjustmentNote,
 		Graphs:      graphs,
 		Best:        best,
@@ -362,6 +360,25 @@ func relativeSeries(lookup map[string][]summaryRecord, baselineID string, specs 
 	return out
 }
 
+func relativeToScenarioSeries(name, color string, lookup map[string][]summaryRecord, scenarioID, baselineScenarioID string) chartSeries {
+	baselineBySize := make(map[int]float64)
+	for _, point := range lookup[baselineScenarioID] {
+		baselineBySize[point.SizeBytes] = point.TotalMeanMS
+	}
+	return chartSeries{
+		Name:   name,
+		Color:  color,
+		Points: sortedPointsByID(lookup, scenarioID),
+		Value: func(summary summaryRecord) float64 {
+			baseline := baselineBySize[summary.SizeBytes]
+			if baseline <= 0 {
+				return 0
+			}
+			return percentDelta(summary.TotalMeanMS, baseline)
+		},
+	}
+}
+
 func relativeSeriesFromPoints(baselineBySize map[int]float64, items ...chartSeries) []chartSeries {
 	out := make([]chartSeries, 0, len(items))
 	for _, item := range items {
@@ -434,7 +451,6 @@ func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord)
 	}
 	return []comparisonTable{
 		buildComparisonTable(lookup, "Quick comparison: 2 hops, 1 circuit", "focused-direct-baseline", "focused-header-only-c1", "focused-full-c1"),
-		buildComparisonTable(lookup, "Quick comparison: 2 hops, 3 circuits", "focused-direct-baseline", "focused-header-only-c3", "focused-full-c3"),
 	}
 }
 

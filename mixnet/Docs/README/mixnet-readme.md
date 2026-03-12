@@ -45,6 +45,24 @@ message:
    meet the reconstruction threshold, verifies tags when enabled, decrypts the
    session payload, and delivers the recovered bytes to the application.
 
+### Header-only relay behavior
+
+`EncryptionModeHeaderOnly` now uses a dedicated stream-through relay path.
+
+- The origin sends a single framed message containing `[encrypted header][payload]`.
+- Intermediate relays decrypt only the onion header required to identify the
+  next hop and rewrite only that header portion.
+- The remaining payload bytes are piped directly from the inbound relay stream
+  to the outbound stream in fixed-size chunks.
+- Intermediate hops do not rebuild a fresh full payload buffer for each hop.
+- The destination still buffers/reconstructs normally because it must reassemble
+  the end-to-end protected session payload before handing bytes to the
+  application.
+
+This is the important implementation detail behind the header-only benchmark
+improvement for large payloads: reduced hop crypto and reduced relay-side copy
+pressure.
+
 This layered flow is why the codebase is split into `config.go`,
 `upgrader.go`, `stream.go`, `privacy_transport.go`, `circuit/`, `relay/`,
 `discovery/`, and `ces/`.

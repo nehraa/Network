@@ -59,6 +59,9 @@ type MixnetConfig struct {
 	// UseCESPipeline enables the CES (Compress-Encrypt-Shard) pipeline.
 	// When disabled, payloads are only encrypted and evenly split across circuits.
 	UseCESPipeline bool
+	// UseCSE enables the Compress-Shard-Encrypt style non-CES fast path so
+	// multi-circuit receivers can decrypt each shard independently on arrival.
+	UseCSE bool
 	// HeaderPaddingEnabled enables padding in privacy headers.
 	HeaderPaddingEnabled bool
 	// HeaderPaddingMin is the minimum header padding in bytes.
@@ -101,6 +104,7 @@ func DefaultConfig() *MixnetConfig {
 		Compression:          "gzip",
 		ErasureThreshold:     0, // 0 means default to 60% of CircuitCount
 		UseCESPipeline:       true,
+		UseCSE:               false,
 		HeaderPaddingEnabled: true,
 		HeaderPaddingMin:     16,
 		HeaderPaddingMax:     256,
@@ -137,6 +141,7 @@ func NewMixnetConfig() *MixnetConfig {
 	cfg.Compression = ""
 	cfg.ErasureThreshold = 0
 	cfg.UseCESPipeline = true
+	cfg.UseCSE = false
 	cfg.HeaderPaddingEnabled = false
 	cfg.HeaderPaddingMin = 0
 	cfg.HeaderPaddingMax = 0
@@ -312,6 +317,17 @@ func (c *MixnetConfig) SetUseCESPipeline(enabled bool) error {
 		return ErrConfigImmutable
 	}
 	c.UseCESPipeline = enabled
+	return nil
+}
+
+// SetUseCSE enables or disables the CSE non-CES shard path.
+func (c *MixnetConfig) SetUseCSE(enabled bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locked {
+		return ErrConfigImmutable
+	}
+	c.UseCSE = enabled
 	return nil
 }
 

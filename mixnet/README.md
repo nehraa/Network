@@ -23,6 +23,25 @@ At a high level:
 5. The destination reconstructs the payload and exposes it through
    `AcceptStream` or the destination-side session channel.
 
+## Header-only streaming behavior
+
+The current header-only transport path is implemented as a streaming fast path,
+not a buffered rewrite at every hop.
+
+- The sender builds the outbound header-only wire frame once.
+- Each intermediate relay decrypts only the onion header needed to learn the
+  next hop.
+- The remaining payload bytes are streamed from the inbound relay stream to the
+  outbound stream in chunks.
+- Intermediate relays do not allocate and rebuild a second full copy of the
+  shard payload on every hop.
+- The destination still buffers and reconstructs the payload as part of normal
+  session delivery.
+
+This matters for large transfers: the main performance win of `header-only`
+mode is not just reduced per-hop crypto, but also avoiding repeated full-payload
+copying at relay hops.
+
 ## Directory structure
 
 | Path | Purpose |

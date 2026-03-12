@@ -53,9 +53,12 @@ const (
 	measurementCES    = "ces-pipeline"
 	measurementLocal  = "local-session"
 
-	directProtocol     protocol.ID = "/mixnet-bench/direct/1.0.0"
-	directKeyProtocol  protocol.ID = "/mixnet-bench/direct-key/1.0.0"
-	benchmarkChunkSize             = 256 * 1024
+	directProtocol             protocol.ID = "/mixnet-bench/direct/1.0.0"
+	directKeyProtocol          protocol.ID = "/mixnet-bench/direct-key/1.0.0"
+	benchmarkChunkSize                     = 256 * 1024
+	benchmarkLargeChunkSize1MB             = 1 * 1024 * 1024
+	benchmarkLargeChunkSize2MB             = 2 * 1024 * 1024
+	benchmarkLargeChunkSize4MB             = 4 * 1024 * 1024
 )
 
 var orderedGroups = []string{
@@ -83,7 +86,9 @@ type suiteOptions struct {
 	Circuits    []int
 	Groups      map[string]bool
 	Runs        int
-	Timeout     time.Duration
+	// SizeRunOverrides allows a per-size run count override (bytes -> runs).
+	SizeRunOverrides map[int]int
+	Timeout          time.Duration
 }
 
 type scenario struct {
@@ -95,6 +100,8 @@ type scenario struct {
 	HopCount               int
 	CircuitCount           int
 	UseCESPipeline         bool
+	UseCSE                 bool
+	UseCompressionOnly     bool
 	Compression            string
 	ErasureThreshold       int
 	SelectionMode          mixnet.SelectionMode
@@ -124,6 +131,8 @@ type runRecord struct {
 	HopCount                int       `json:"hop_count"`
 	CircuitCount            int       `json:"circuit_count"`
 	UseCESPipeline          bool      `json:"use_ces_pipeline"`
+	UseCSE                  bool      `json:"use_cse"`
+	UseCompressionOnly      bool      `json:"use_compression_only"`
 	Compression             string    `json:"compression"`
 	ErasureThreshold        int       `json:"erasure_threshold"`
 	ErasureThresholdPercent float64   `json:"erasure_threshold_percent"`
@@ -155,6 +164,8 @@ type summaryRecord struct {
 	HopCount                int     `json:"hop_count"`
 	CircuitCount            int     `json:"circuit_count"`
 	UseCESPipeline          bool    `json:"use_ces_pipeline"`
+	UseCSE                  bool    `json:"use_cse"`
+	UseCompressionOnly      bool    `json:"use_compression_only"`
 	Compression             string  `json:"compression"`
 	ErasureThreshold        int     `json:"erasure_threshold"`
 	ErasureThresholdPercent float64 `json:"erasure_threshold_percent"`
@@ -213,14 +224,14 @@ func profileOptions(name string) (suiteOptions, error) {
 			HopSpec:     "1,2",
 			CircuitSpec: "1,2,4",
 			GroupSpec:   strings.Join([]string{groupModeOverview, groupHopSweep, groupCircuitSweep, groupCESPipeline, groupCompression}, ","),
-			Runs:        3,
+			Runs:        12,
 		}, nil
 	case "quick":
 		return suiteOptions{
 			Profile:     name,
-			SizeSpec:    "256KB,1MB,8MB,32MB,64MB,128MB,256MB,512MB",
+			SizeSpec:    "16MB,32MB,64MB,128MB,256MB,512MB",
 			HopSpec:     "2",
-			CircuitSpec: "1,3",
+			CircuitSpec: "1",
 			GroupSpec:   groupFocusedOnion,
 			Runs:        12,
 		}, nil
@@ -231,7 +242,7 @@ func profileOptions(name string) (suiteOptions, error) {
 			HopSpec:     "1,2,3,4",
 			CircuitSpec: "1,2,3,4,5,6",
 			GroupSpec:   strings.Join(orderedGroups, ","),
-			Runs:        6,
+			Runs:        12,
 		}, nil
 	default:
 		return suiteOptions{}, fmt.Errorf("unknown profile %q", name)
@@ -258,14 +269,31 @@ func (o suiteOptions) normalize() (suiteOptions, error) {
 	if o.Runs < 1 {
 		return suiteOptions{}, fmt.Errorf("runs must be at least 1")
 	}
-	if o.Timeout <= 0 {
-		return suiteOptions{}, fmt.Errorf("timeout must be > 0")
-	}
 	o.Sizes = sizes
 	o.Hops = hops
 	o.Circuits = circuits
 	o.Groups = groups
+	if o.Timeout <= 0 {
+		o.Timeout = defaultRunTimeoutForSizes(sizes)
+	}
 	return o, nil
+}
+
+func defaultRunTimeoutForSizes(sizes []int) time.Duration {
+	maxSize := 0
+	for _, size := range sizes {
+		if size > maxSize {
+			maxSize = size
+		}
+	}
+	switch {
+	case maxSize >= 512*1024*1024:
+		return 10 * time.Minute
+	case maxSize >= 128*1024*1024:
+		return 5 * time.Minute
+	default:
+		return 2 * time.Minute
+	}
 }
 
 func runSuite(opts suiteOptions) error {
@@ -283,15 +311,20 @@ func runSuite(opts suiteOptions) error {
 	}
 
 	scenarios := buildScenarios(opts)
-	fmt.Printf("mixnet-bench: profile=%s scenarios=%d sizes=%d runs=%d output=%s\n", opts.Profile, len(scenarios), len(opts.Sizes), opts.Runs, opts.OutputDir)
+	fmt.Printf("mixnet-bench: profile=%s scenarios=%d sizes=%d runs=%s output=%s\n",
+		opts.Profile, len(scenarios), len(opts.Sizes), opts.runsSummary(), opts.OutputDir)
 
-	runRecords := make([]*runRecord, 0, len(scenarios)*len(opts.Sizes)*opts.Runs)
-	totalWork := len(scenarios) * len(opts.Sizes) * opts.Runs
+	totalWork := 0
+	for _, size := range opts.Sizes {
+		totalWork += len(scenarios) * opts.runsForSize(size)
+	}
+	runRecords := make([]*runRecord, 0, totalWork)
 	workIndex := 0
 
 	for _, sc := range scenarios {
 		for _, size := range opts.Sizes {
-			for runIdx := 1; runIdx <= opts.Runs; runIdx++ {
+			runs := opts.runsForSize(size)
+			for runIdx := 1; runIdx <= runs; runIdx++ {
 				workIndex++
 				fmt.Printf("[%d/%d] %s size=%s run=%d\n", workIndex, totalWork, sc.ID, formatBytes(size), runIdx)
 				rec, err := executeScenario(opts, sc, size, runIdx)
@@ -299,7 +332,7 @@ func runSuite(opts suiteOptions) error {
 					return err
 				}
 				runRecords = append(runRecords, rec)
-				releaseBenchmarkMemory()
+				releaseBenchmarkMemoryForSize(size)
 			}
 		}
 	}
@@ -334,6 +367,13 @@ func releaseBenchmarkMemory() {
 	runtime.GC()
 	debug.FreeOSMemory()
 	time.Sleep(100 * time.Millisecond)
+}
+
+func releaseBenchmarkMemoryForSize(size int) {
+	releaseBenchmarkMemory()
+	if size >= 2*1024*1024*1024 {
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func buildScenarios(opts suiteOptions) []scenario {
@@ -448,8 +488,6 @@ func buildScenarios(opts suiteOptions) []scenario {
 			out = append(out,
 				newMixnetScenario("focused-header-only-c1", groupFocusedOnion, "Header-only 2 hops 1 circuit", "header-only", 2, 1, false),
 				newMixnetScenario("focused-full-c1", groupFocusedOnion, "Full onion 2 hops 1 circuit", "full", 2, 1, false),
-				newMixnetScenario("focused-header-only-c3", groupFocusedOnion, "Header-only 2 hops 3 circuits", "header-only", 2, 3, false),
-				newMixnetScenario("focused-full-c3", groupFocusedOnion, "Full onion 2 hops 3 circuits", "full", 2, 3, false),
 			)
 		} else {
 			out = append(out,
@@ -465,6 +503,8 @@ func buildScenarios(opts suiteOptions) []scenario {
 				newMixnetScenario("focused-full-c1-ces", groupFocusedOnion, "Full onion 2 hops 1 circuit + CES", "full", 2, 1, true),
 				newMixnetScenario("focused-header-only-c3-ces", groupFocusedOnion, "Header-only 2 hops 3 circuits + CES", "header-only", 2, 3, true),
 				newMixnetScenario("focused-full-c3-ces", groupFocusedOnion, "Full onion 2 hops 3 circuits + CES", "full", 2, 3, true),
+				newCSEScenario("focused-header-only-c3-cse", groupFocusedOnion, "Header-only 2 hops 3 circuits CSE", "header-only", 2, 3),
+				newCSEScenario("focused-full-c3-cse", groupFocusedOnion, "Full onion 2 hops 3 circuits CSE", "full", 2, 3),
 			)
 		}
 	}
@@ -488,6 +528,21 @@ func newMixnetScenario(id, category, label, mode string, hops, circuits int, use
 	}
 }
 
+func newCSEScenario(id, category, label, mode string, hops, circuits int) scenario {
+	sc := newMixnetScenario(id, category, label, mode, hops, circuits, false)
+	sc.UseCSE = true
+	return sc
+}
+
+func newCompressedScenario(id, category, label, mode string, hops, circuits int) scenario {
+	sc := newMixnetScenario(id, category, label, mode, hops, circuits, false)
+	if mode == "direct" {
+		sc.Measurement = measurementDirect
+	}
+	sc.UseCompressionOnly = true
+	return sc
+}
+
 func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*runRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
@@ -506,6 +561,8 @@ func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*run
 		HopCount:                sc.HopCount,
 		CircuitCount:            sc.CircuitCount,
 		UseCESPipeline:          sc.UseCESPipeline,
+		UseCSE:                  sc.UseCSE,
+		UseCompressionOnly:      sc.UseCompressionOnly,
 		Compression:             sc.Compression,
 		ErasureThreshold:        effectiveThreshold(sc),
 		ErasureThresholdPercent: thresholdPercent(sc),
@@ -519,7 +576,7 @@ func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*run
 	var err error
 	switch sc.Measurement {
 	case measurementDirect:
-		err = runDirectTransfer(ctx, payload, rec)
+		err = runDirectTransfer(ctx, sc, payload, rec)
 	case measurementLocal:
 		err = runLocalSessionPipeline(ctx, sc, payload, rec)
 	case measurementCES:
@@ -534,7 +591,11 @@ func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*run
 	return rec, nil
 }
 
-func runDirectTransfer(ctx context.Context, payload []byte, rec *runRecord) error {
+func runDirectTransfer(ctx context.Context, sc scenario, payload []byte, rec *runRecord) error {
+	wirePayload, decodeReceived, err := prepareCompressionPayload(sc, payload, rec)
+	if err != nil {
+		return err
+	}
 	origin, err := newBenchHost()
 	if err != nil {
 		return err
@@ -547,70 +608,73 @@ func runDirectTransfer(ctx context.Context, payload []byte, rec *runRecord) erro
 	}
 	defer dest.Close()
 
-	keyStore := &benchmarkSessionKeyStore{}
+	destInfo := peer.AddrInfo{ID: dest.ID(), Addrs: dest.Addrs()}
+	// Benchmark mixnet runs on a fully connected underlay before circuit setup is
+	// timed. Warm the direct path the same way so "direct baseline" is not paying
+	// an extra first-dial cost that the mixnet scenarios never include.
+	if err := origin.Connect(ctx, destInfo); err != nil {
+		return fmt.Errorf("preconnect direct hosts: %w", err)
+	}
+
 	received := make(chan []byte, 1)
+	readDoneCh := make(chan struct{}, 1)
 	errCh := make(chan error, 2)
-	installDirectSessionKeyHandler(dest, keyStore, errCh)
 	dest.SetStreamHandler(directProtocol, func(s network.Stream) {
 		defer s.Close()
-		keyData := keyStore.Take()
-		if len(keyData) == 0 {
-			reportAsyncError(errCh, fmt.Errorf("missing direct session key"))
+		if sc.UseCompressionOnly {
+			data, err := readDirectSessionPayload(s, len(wirePayload))
+			if err != nil {
+				reportAsyncError(errCh, fmt.Errorf("read direct payload: %w", err))
+				return
+			}
+			received <- data
 			return
 		}
-		session, err := decodeBenchmarkSessionKeyData(keyData)
-		if err != nil {
-			reportAsyncError(errCh, fmt.Errorf("decode direct session key: %w", err))
+		if err := verifyDirectSessionPayload(s, wirePayload); err != nil {
+			reportAsyncError(errCh, fmt.Errorf("verify direct payload: %w", err))
 			return
 		}
-		plaintext, err := readDirectEncryptedChunks(s, session, len(payload))
-		if err != nil {
-			reportAsyncError(errCh, fmt.Errorf("decrypt direct payload: %w", err))
-			return
-		}
-		received <- plaintext
+		readDoneCh <- struct{}{}
 	})
 
 	connectStart := time.Now()
-	if err := origin.Connect(ctx, peer.AddrInfo{ID: dest.ID(), Addrs: dest.Addrs()}); err != nil {
+	if err := origin.Connect(ctx, destInfo); err != nil {
 		return fmt.Errorf("connect direct hosts: %w", err)
 	}
 	rec.ConnectMS = millisSince(connectStart)
 
-	keyData, session, err := benchmarkDirectSessionMaterial()
-	if err != nil {
-		return fmt.Errorf("build direct session key: %w", err)
-	}
+	rec.KeyExchangeMS = 0
 
-	keyStart := time.Now()
-	if err := exchangeDirectSessionKey(ctx, origin, dest.ID(), keyData); err != nil {
-		return fmt.Errorf("exchange direct session key: %w", err)
-	}
-	select {
-	case err := <-errCh:
-		return fmt.Errorf("receive direct session key: %w", err)
-	default:
-	}
-	rec.KeyExchangeMS = millisSince(keyStart)
-
-	transferStart := time.Now()
 	stream, err := origin.NewStream(ctx, dest.ID(), directProtocol)
 	if err != nil {
 		return fmt.Errorf("open direct stream: %w", err)
 	}
-	for chunkIndex, offset := uint64(0), 0; offset < len(payload); chunkIndex, offset = chunkIndex+1, offset+benchmarkChunkSize {
-		end := offset + benchmarkChunkSize
-		if end > len(payload) {
-			end = len(payload)
+	if flusher, ok := stream.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			_ = stream.Reset()
+			return fmt.Errorf("flush direct stream negotiation: %w", err)
 		}
-		ciphertext, err := encryptDirectChunk(session, chunkIndex, payload[offset:end])
+	}
+
+	transferStart := time.Now()
+	chunkSize := benchmarkIOChunkSize(len(wirePayload))
+	for offset := 0; offset < len(wirePayload); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(wirePayload) {
+			end = len(wirePayload)
+		}
+		ciphertext, keyData, err := mixnet.EncryptSessionPayload(wirePayload[offset:end])
 		if err != nil {
 			_ = stream.Close()
-			return fmt.Errorf("encrypt direct chunk: %w", err)
+			return fmt.Errorf("encrypt direct payload chunk: %w", err)
+		}
+		if err := writeDirectFrame(stream, keyData); err != nil {
+			_ = stream.Close()
+			return fmt.Errorf("write direct session key: %w", err)
 		}
 		if err := writeDirectFrame(stream, ciphertext); err != nil {
 			_ = stream.Close()
-			return fmt.Errorf("write direct frame: %w", err)
+			return fmt.Errorf("write direct payload chunk: %w", err)
 		}
 	}
 	if err := stream.Close(); err != nil {
@@ -619,20 +683,31 @@ func runDirectTransfer(ctx context.Context, payload []byte, rec *runRecord) erro
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("receive direct payload: %w", err)
+	case <-readDoneCh:
 	case data := <-received:
-		if !bytes.Equal(data, payload) {
-			return fmt.Errorf("direct payload mismatch: got=%d want=%d", len(data), len(payload))
+		if sc.UseCompressionOnly {
+			decoded, err := decodeReceived(data)
+			if err != nil {
+				return fmt.Errorf("decode direct payload: %w", err)
+			}
+			if !bytes.Equal(decoded, payload) {
+				return fmt.Errorf("direct payload mismatch: got=%d want=%d", len(decoded), len(payload))
+			}
 		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 	rec.TransferMS = millisSince(transferStart)
-	rec.TotalMS = rec.ConnectMS + rec.KeyExchangeMS + rec.TransferMS
+	rec.TotalMS = rec.ConnectMS + rec.KeyExchangeMS + rec.TransferMS + rec.PipelineProcessMS + rec.PipelineReconstructMS
 	rec.ThroughputMBps = mibPerSecond(len(payload), rec.TotalMS)
 	return nil
 }
 
 func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *runRecord) error {
+	wirePayload, decodeReceived, err := prepareCompressionPayload(sc, payload, rec)
+	if err != nil {
+		return err
+	}
 	cfg, err := sc.config()
 	if err != nil {
 		return err
@@ -644,9 +719,6 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 		return err
 	}
 	defer cleanup()
-
-	destKeyErrCh := make(chan error, 1)
-	installDirectSessionKeyHandler(dest.Host(), nil, destKeyErrCh)
 
 	connectStart := time.Now()
 	circuits, err := origin.EstablishConnection(ctx, dest.Host().ID())
@@ -661,22 +733,8 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	}
 	rec.KeyExchangeMS = millisSince(keyStart)
 
-	destKeyData, err := benchmarkSessionKeyData()
-	if err != nil {
-		return fmt.Errorf("build destination session key: %w", err)
-	}
-	destKeyStart := time.Now()
-	if err := exchangeDirectSessionKey(ctx, origin.Host(), dest.Host().ID(), destKeyData); err != nil {
-		return fmt.Errorf("exchange destination session key: %w", err)
-	}
-	select {
-	case err := <-destKeyErrCh:
-		return fmt.Errorf("receive destination session key: %w", err)
-	default:
-	}
-	rec.KeyExchangeMS += millisSince(destKeyStart)
-
 	readCh := make(chan []byte, 1)
+	readDoneCh := make(chan struct{}, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		stream, err := dest.AcceptStream(ctx)
@@ -685,20 +743,22 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 			return
 		}
 		defer stream.Close()
-		buf := make([]byte, benchmarkChunkSize)
-		out := make([]byte, 0, len(payload))
-		for len(out) < len(payload) {
-			n, readErr := stream.Read(buf)
+
+		if sc.UseCompressionOnly {
+			out, readErr := readMixnetPayload(stream, len(wirePayload))
 			if readErr != nil {
 				errCh <- readErr
 				return
 			}
-			out = append(out, buf[:n]...)
+			readCh <- out
+			return
 		}
-		if len(out) > len(payload) {
-			out = out[:len(payload)]
+
+		if readErr := verifyMixnetPayload(stream, payload); readErr != nil {
+			errCh <- readErr
+			return
 		}
-		readCh <- out
+		readDoneCh <- struct{}{}
 	}()
 
 	originStream, err := origin.OpenStream(ctx, dest.Host().ID())
@@ -708,31 +768,75 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	defer originStream.Close()
 
 	transferStart := time.Now()
-	for offset := 0; offset < len(payload); offset += benchmarkChunkSize {
-		end := offset + benchmarkChunkSize
-		if end > len(payload) {
-			end = len(payload)
+	chunkSize := benchmarkIOChunkSize(len(wirePayload))
+	for offset := 0; offset < len(wirePayload); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(wirePayload) {
+			end = len(wirePayload)
 		}
-		if _, err := originStream.Write(payload[offset:end]); err != nil {
-			return fmt.Errorf("write mixnet chunk: %w", err)
+		if _, err := originStream.Write(wirePayload[offset:end]); err != nil {
+			return fmt.Errorf("write mixnet payload chunk: %w", err)
 		}
 	}
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("receive mixnet payload: %w", err)
+	case <-readDoneCh:
+		// The common mixnet path already verified bytes incrementally without
+		// buffering a second 512 MiB copy on the destination side.
 	case data := <-readCh:
-		if len(data) != len(payload) {
-			return fmt.Errorf("mixnet payload length mismatch: got=%d want=%d", len(data), len(payload))
+		decoded, err := decodeReceived(data)
+		if err != nil {
+			return fmt.Errorf("decode mixnet payload: %w", err)
+		}
+		if !bytes.Equal(decoded, payload) {
+			return fmt.Errorf("mixnet payload mismatch: got=%d want=%d", len(decoded), len(payload))
 		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 	rec.TransferMS = millisSince(transferStart)
-	rec.TotalMS = rec.ConnectMS + rec.KeyExchangeMS + rec.TransferMS
+	rec.TotalMS = rec.ConnectMS + rec.KeyExchangeMS + rec.TransferMS + rec.PipelineProcessMS + rec.PipelineReconstructMS
 	if sc.HopCount > 0 {
 		rec.PerHopMS = rec.TotalMS / float64(sc.HopCount)
 	}
 	rec.ThroughputMBps = mibPerSecond(len(payload), rec.TotalMS)
+	return nil
+}
+
+func readMixnetPayload(stream *mixnet.MixStream, expectedLen int) ([]byte, error) {
+	buf := make([]byte, benchmarkReadBufferSize(expectedLen))
+	out := make([]byte, 0, expectedLen)
+	for len(out) < expectedLen {
+		n, err := stream.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, buf[:n]...)
+	}
+	if len(out) > expectedLen {
+		out = out[:expectedLen]
+	}
+	return out, nil
+}
+
+func verifyMixnetPayload(stream *mixnet.MixStream, expected []byte) error {
+	buf := make([]byte, benchmarkReadBufferSize(len(expected)))
+	received := 0
+	for received < len(expected) {
+		n, err := stream.Read(buf)
+		if err != nil {
+			return err
+		}
+		end := received + n
+		if end > len(expected) {
+			return fmt.Errorf("mixnet payload overflow: got=%d want=%d", end, len(expected))
+		}
+		if !bytes.Equal(buf[:n], expected[received:end]) {
+			return fmt.Errorf("mixnet payload mismatch at offset=%d", received)
+		}
+		received = end
+	}
 	return nil
 }
 
@@ -870,20 +974,133 @@ func writeDirectFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
-func readDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, expectedLen int) ([]byte, error) {
+func readDirectFrame(r io.Reader) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
+	if payloadLen < 0 {
+		return nil, fmt.Errorf("invalid direct frame length")
+	}
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func readDirectSessionPayload(r io.Reader, expectedLen int) ([]byte, error) {
 	out := make([]byte, 0, expectedLen)
-	for chunkIndex := uint64(0); len(out) < expectedLen; chunkIndex++ {
-		var lenBuf [4]byte
-		_, err := io.ReadFull(r, lenBuf[:])
+	for len(out) < expectedLen {
+		keyData, err := readDirectFrame(r)
 		if err != nil {
 			return nil, err
 		}
+		if len(keyData) == 0 {
+			return nil, fmt.Errorf("missing direct session key")
+		}
+		session, err := mixnet.DecodeSessionKeyData(keyData)
+		if err != nil {
+			return nil, err
+		}
+		ciphertext, err := readDirectFrame(r)
+		if err != nil {
+			return nil, err
+		}
+		plaintext, err := mixnet.DecryptSessionPayload(ciphertext, session)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, plaintext...)
+	}
+	if len(out) > expectedLen {
+		out = out[:expectedLen]
+	}
+	return out, nil
+}
+
+func verifyDirectSessionPayload(r io.Reader, expected []byte) error {
+	received := 0
+	for received < len(expected) {
+		keyData, err := readDirectFrame(r)
+		if err != nil {
+			return err
+		}
+		if len(keyData) == 0 {
+			return fmt.Errorf("missing direct session key")
+		}
+		session, err := mixnet.DecodeSessionKeyData(keyData)
+		if err != nil {
+			return err
+		}
+		ciphertext, err := readDirectFrame(r)
+		if err != nil {
+			return err
+		}
+		plaintext, err := mixnet.DecryptSessionPayload(ciphertext, session)
+		if err != nil {
+			return err
+		}
+		end := received + len(plaintext)
+		if end > len(expected) {
+			return fmt.Errorf("direct payload overflow: got=%d want=%d", end, len(expected))
+		}
+		if !bytes.Equal(plaintext, expected[received:end]) {
+			return fmt.Errorf("direct payload mismatch at offset=%d", received)
+		}
+		received = end
+	}
+	return nil
+}
+
+func readDirectPayload(r io.Reader, expectedLen int) ([]byte, error) {
+	out := make([]byte, 0, expectedLen)
+	for len(out) < expectedLen {
+		payload, err := readDirectFrame(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, payload...)
+	}
+	if len(out) > expectedLen {
+		out = out[:expectedLen]
+	}
+	return out, nil
+}
+
+func verifyDirectPayload(r io.Reader, expected []byte) error {
+	received := 0
+	for received < len(expected) {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			return err
+		}
 		payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 		if payloadLen < 0 {
-			return nil, fmt.Errorf("invalid direct frame length")
+			return fmt.Errorf("invalid direct frame length")
 		}
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(r, payload); err != nil {
+			return err
+		}
+		end := received + len(payload)
+		if end > len(expected) {
+			return fmt.Errorf("direct payload overflow: got=%d want=%d", end, len(expected))
+		}
+		if !bytes.Equal(payload, expected[received:end]) {
+			return fmt.Errorf("direct payload mismatch at offset=%d", received)
+		}
+		received = end
+	}
+	return nil
+}
+
+func readDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, expectedLen int) ([]byte, error) {
+	out := make([]byte, 0, expectedLen)
+	for chunkIndex := uint64(0); len(out) < expectedLen; chunkIndex++ {
+		payload, err := readDirectFrame(r)
+		if err != nil {
 			return nil, err
 		}
 		plaintext, err := decryptDirectChunk(session, chunkIndex, payload)
@@ -898,6 +1115,46 @@ func readDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, ex
 	return out, nil
 }
 
+func verifyDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, expected []byte) error {
+	received := 0
+	for chunkIndex := uint64(0); received < len(expected); chunkIndex++ {
+		payload, err := readDirectFrame(r)
+		if err != nil {
+			return err
+		}
+		plaintext, err := decryptDirectChunk(session, chunkIndex, payload)
+		if err != nil {
+			return err
+		}
+		end := received + len(plaintext)
+		if end > len(expected) {
+			return fmt.Errorf("direct payload overflow: got=%d want=%d", end, len(expected))
+		}
+		if !bytes.Equal(plaintext, expected[received:end]) {
+			return fmt.Errorf("direct payload mismatch at offset=%d", received)
+		}
+		received = end
+	}
+	return nil
+}
+
+func benchmarkIOChunkSize(totalBytes int) int {
+	switch {
+	case totalBytes >= 512*1024*1024:
+		return benchmarkLargeChunkSize4MB
+	case totalBytes >= 64*1024*1024:
+		return benchmarkLargeChunkSize2MB
+	case totalBytes >= 16*1024*1024:
+		return benchmarkLargeChunkSize1MB
+	default:
+		return benchmarkChunkSize
+	}
+}
+
+func benchmarkReadBufferSize(expectedLen int) int {
+	return benchmarkIOChunkSize(expectedLen)
+}
+
 func reportAsyncError(errCh chan<- error, err error) {
 	if err == nil || errCh == nil {
 		return
@@ -906,6 +1163,28 @@ func reportAsyncError(errCh chan<- error, err error) {
 	case errCh <- err:
 	default:
 	}
+}
+
+func prepareCompressionPayload(sc scenario, payload []byte, rec *runRecord) ([]byte, func([]byte) ([]byte, error), error) {
+	if !sc.UseCompressionOnly {
+		return payload, func(data []byte) ([]byte, error) { return data, nil }, nil
+	}
+	compressor := ces.NewCompressor(fallbackCompression(sc.Compression))
+	processStart := time.Now()
+	compressed, err := compressor.Compress(payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compress benchmark payload: %w", err)
+	}
+	rec.PipelineProcessMS = millisSince(processStart)
+	return compressed, func(data []byte) ([]byte, error) {
+		reconstructStart := time.Now()
+		out, err := compressor.Decompress(data)
+		rec.PipelineReconstructMS = millisSince(reconstructStart)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	}, nil
 }
 
 func runCESPipeline(ctx context.Context, sc scenario, payload []byte, rec *runRecord) error {
@@ -1047,6 +1326,7 @@ func (s scenario) config() (*mixnet.MixnetConfig, error) {
 	cfg.HopCount = s.HopCount
 	cfg.CircuitCount = s.CircuitCount
 	cfg.UseCESPipeline = s.UseCESPipeline
+	cfg.UseCSE = s.UseCSE
 	cfg.Compression = fallbackCompression(s.Compression)
 	cfg.ErasureThreshold = effectiveThreshold(s)
 	cfg.MaxJitter = s.MaxJitter
@@ -1247,6 +1527,8 @@ func summarizeRuns(records []*runRecord) ([]summaryRecord, error) {
 			HopCount:                base.HopCount,
 			CircuitCount:            base.CircuitCount,
 			UseCESPipeline:          base.UseCESPipeline,
+			UseCSE:                  base.UseCSE,
+			UseCompressionOnly:      base.UseCompressionOnly,
 			Compression:             base.Compression,
 			ErasureThreshold:        base.ErasureThreshold,
 			ErasureThresholdPercent: base.ErasureThresholdPercent,
@@ -1309,6 +1591,57 @@ func describeOutlierRule(runs int) string {
 	return fmt.Sprintf("exclude the %d runs farthest from the median total latency", trimCount)
 }
 
+func describeOutlierRuleWithOverrides(defaultRuns int, overrides map[int]int) string {
+	rule := describeOutlierRule(defaultRuns)
+	if len(overrides) == 0 {
+		return rule
+	}
+	type entry struct {
+		size int
+		runs int
+	}
+	list := make([]entry, 0, len(overrides))
+	for size, runs := range overrides {
+		list = append(list, entry{size: size, runs: runs})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].size < list[j].size })
+	parts := make([]string, 0, len(list))
+	for _, item := range list {
+		parts = append(parts, fmt.Sprintf("%s uses %d runs (%s)", formatBytes(item.size), item.runs, describeOutlierRule(item.runs)))
+	}
+	return fmt.Sprintf("%s; overrides: %s", rule, strings.Join(parts, "; "))
+}
+
+func (o suiteOptions) runsForSize(size int) int {
+	if o.SizeRunOverrides == nil {
+		return o.Runs
+	}
+	if runs, ok := o.SizeRunOverrides[size]; ok && runs > 0 {
+		return runs
+	}
+	return o.Runs
+}
+
+func (o suiteOptions) runsSummary() string {
+	if len(o.SizeRunOverrides) == 0 {
+		return strconv.Itoa(o.Runs)
+	}
+	type entry struct {
+		size int
+		runs int
+	}
+	list := make([]entry, 0, len(o.SizeRunOverrides))
+	for size, runs := range o.SizeRunOverrides {
+		list = append(list, entry{size: size, runs: runs})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].size < list[j].size })
+	parts := make([]string, 0, len(list))
+	for _, item := range list {
+		parts = append(parts, fmt.Sprintf("%s=%d", formatBytes(item.size), item.runs))
+	}
+	return fmt.Sprintf("%d (overrides: %s)", o.Runs, strings.Join(parts, ", "))
+}
+
 func bestEfficiencySummaries(summaries []summaryRecord) []bestRecord {
 	bestByModeAndSize := make(map[string]summaryRecord)
 	for _, summary := range summaries {
@@ -1359,7 +1692,10 @@ func writeMetadata(opts suiteOptions, scenarios []scenario) error {
 		"groups":      sortedGroupNames(opts.Groups),
 		"timeout":     opts.Timeout.String(),
 		"scenarios":   scenarios,
-		"outlierRule": describeOutlierRule(opts.Runs),
+		"outlierRule": describeOutlierRuleWithOverrides(opts.Runs, opts.SizeRunOverrides),
+	}
+	if len(opts.SizeRunOverrides) > 0 {
+		meta["sizeRunOverrides"] = opts.SizeRunOverrides
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -1393,7 +1729,7 @@ func writeRawRecords(outputDir string, records []*runRecord) error {
 	defer csvFile.Close()
 	writer := csv.NewWriter(csvFile)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
@@ -1401,7 +1737,7 @@ func writeRawRecords(outputDir string, records []*runRecord) error {
 		row := []string{
 			rec.ScenarioID, rec.Category, rec.Label, rec.Measurement, rec.Mode,
 			strconv.Itoa(rec.SizeBytes), rec.SizeLabel, strconv.Itoa(rec.RunIndex), rec.TimestampUTC.Format(time.RFC3339),
-			strconv.Itoa(rec.HopCount), strconv.Itoa(rec.CircuitCount), strconv.FormatBool(rec.UseCESPipeline),
+			strconv.Itoa(rec.HopCount), strconv.Itoa(rec.CircuitCount), strconv.FormatBool(rec.UseCESPipeline), strconv.FormatBool(rec.UseCSE), strconv.FormatBool(rec.UseCompressionOnly),
 			rec.Compression, strconv.Itoa(rec.ErasureThreshold), fmt.Sprintf("%.2f", rec.ErasureThresholdPercent),
 			rec.SelectionMode, rec.PayloadPaddingStrategy, strconv.FormatBool(rec.HeaderPaddingEnabled),
 			strconv.FormatBool(rec.EnableAuthTag), strconv.Itoa(rec.MaxJitterMS),
@@ -1432,7 +1768,7 @@ func writeSummaryRecords(outputDir string, summaries []summaryRecord) error {
 	defer file.Close()
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
@@ -1440,7 +1776,7 @@ func writeSummaryRecords(outputDir string, summaries []summaryRecord) error {
 		row := []string{
 			s.ScenarioID, s.Category, s.Label, s.Measurement, s.Mode,
 			strconv.Itoa(s.SizeBytes), s.SizeLabel, strconv.Itoa(s.HopCount), strconv.Itoa(s.CircuitCount),
-			strconv.FormatBool(s.UseCESPipeline), s.Compression, strconv.Itoa(s.ErasureThreshold), fmt.Sprintf("%.2f", s.ErasureThresholdPercent),
+			strconv.FormatBool(s.UseCESPipeline), strconv.FormatBool(s.UseCSE), strconv.FormatBool(s.UseCompressionOnly), s.Compression, strconv.Itoa(s.ErasureThreshold), fmt.Sprintf("%.2f", s.ErasureThresholdPercent),
 			s.SelectionMode, s.PayloadPaddingStrategy, strconv.FormatBool(s.HeaderPaddingEnabled), strconv.FormatBool(s.EnableAuthTag), strconv.Itoa(s.MaxJitterMS),
 			strconv.Itoa(s.TotalRuns), strconv.Itoa(s.KeptRuns), strconv.Itoa(s.ExcludedRunIndex),
 			fmt.Sprintf("%.6f", s.ConnectMeanMS), fmt.Sprintf("%.6f", s.ConnectStdDevMS),
@@ -1630,6 +1966,9 @@ func parseSize(raw string) (int, error) {
 	case strings.HasSuffix(upper, "MB"):
 		multiplier = 1024 * 1024
 		upper = strings.TrimSuffix(upper, "MB")
+	case strings.HasSuffix(upper, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		upper = strings.TrimSuffix(upper, "GB")
 	case strings.HasSuffix(upper, "B"):
 		upper = strings.TrimSuffix(upper, "B")
 	}
@@ -1756,14 +2095,10 @@ func outlierTrimCount(runs int) int {
 	if runs <= 1 {
 		return 0
 	}
-	trim := runs / 6
-	if trim < 1 {
-		trim = 1
+	if runs >= 12 {
+		return 2
 	}
-	if trim >= runs {
-		trim = runs - 1
-	}
-	return trim
+	return 1
 }
 
 func outlierIndices(values []float64, count int) map[int]bool {
@@ -1833,6 +2168,13 @@ func sortedGroupNames(groups map[string]bool) []string {
 }
 
 func formatBytes(size int) string {
+	if size >= 1024*1024*1024 {
+		value := float64(size) / float64(1024*1024*1024)
+		if math.Mod(value, 1) == 0 {
+			return fmt.Sprintf("%.0fGB", value)
+		}
+		return fmt.Sprintf("%.2fGB", value)
+	}
 	if size >= 1024*1024 {
 		value := float64(size) / float64(1024*1024)
 		if math.Mod(value, 1) == 0 {

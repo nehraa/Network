@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,9 @@ func (m *Mixnet) OpenStream(ctx context.Context, dest peer.ID) (*MixStream, erro
 		return nil, err
 	}
 	sessionID := newStreamSessionID()
+	if err := m.registerStreamSession(sessionID); err != nil {
+		return nil, err
+	}
 	ch := m.destHandler.registerSession(sessionID)
 	return &MixStream{
 		mixnet:    m,
@@ -143,6 +147,7 @@ func (s *MixStream) Close() error {
 	s.closed = true
 	s.mu.Unlock()
 
+	s.mixnet.clearStreamSession(s.sessionID)
 	s.mixnet.destHandler.unregisterSession(s.sessionID)
 	return nil
 }
@@ -183,13 +188,22 @@ func streamWriteSessionID(base string, seq uint64) string {
 	return fmt.Sprintf("%s%s%0*x", base, streamWriteDelimiter, streamWriteSeqWidth, seq)
 }
 
-func baseSessionID(sessionID string) string {
+func parseStreamWriteSequence(sessionID string) (string, uint64, bool) {
 	idx := strings.LastIndex(sessionID, streamWriteDelimiter)
 	if idx <= 0 || len(sessionID)-idx-1 != streamWriteSeqWidth {
+		return sessionID, 0, false
+	}
+	seq, err := strconv.ParseUint(sessionID[idx+1:], 16, 64)
+	if err != nil {
+		return sessionID, 0, false
+	}
+	return sessionID[:idx], seq, true
+}
+
+func baseSessionID(sessionID string) string {
+	base, _, ok := parseStreamWriteSequence(sessionID)
+	if !ok {
 		return sessionID
 	}
-	if _, err := hex.DecodeString(sessionID[idx+1:]); err != nil {
-		return sessionID
-	}
-	return sessionID[:idx]
+	return base
 }

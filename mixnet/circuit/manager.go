@@ -37,11 +37,12 @@ type CircuitConfig struct {
 
 // StreamHandler tracks the active libp2p stream associated with a circuit.
 type StreamHandler struct {
-	stream network.Stream
-	peerID peer.ID
+	stream  network.Stream
+	peerID  peer.ID
+	writeMu sync.Mutex
 }
 
-const maxCircuitWriteChunk = 32 * 1024
+const maxCircuitWriteChunk = 256 * 1024
 
 // Stream returns the underlying libp2p stream bound to the circuit.
 func (h *StreamHandler) Stream() network.Stream {
@@ -217,21 +218,23 @@ func (m *CircuitManager) SendData(circuitID string, data []byte) error {
 		return fmt.Errorf("no stream for circuit %s", circuitID)
 	}
 
-	for len(data) > 0 {
-		chunk := data
-		if len(chunk) > maxCircuitWriteChunk {
-			chunk = chunk[:maxCircuitWriteChunk]
-		}
-		n, err := handler.stream.Write(chunk)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return fmt.Errorf("short write on circuit %s", circuitID)
-		}
-		data = data[n:]
+	return writeCircuitParts(handler, circuitID, m.cfg.StreamTimeout, data)
+}
+
+// SendDataParts writes multiple byte slices onto the libp2p stream associated
+// with circuitID while holding the per-circuit write lock across the full
+// sequence. This lets callers avoid building a single combined frame buffer
+// while still preserving write ordering on that circuit.
+func (m *CircuitManager) SendDataParts(circuitID string, parts ...[]byte) error {
+	m.mu.RLock()
+	handler, ok := m.streams[circuitID]
+	m.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("no stream for circuit %s", circuitID)
 	}
-	return nil
+
+	return writeCircuitParts(handler, circuitID, m.cfg.StreamTimeout, parts...)
 }
 
 // ReadData reads raw bytes from the libp2p stream associated with circuitID.
@@ -245,6 +248,44 @@ func (m *CircuitManager) ReadData(circuitID string, buf []byte) (int, error) {
 	}
 
 	return handler.stream.Read(buf)
+}
+
+func writeCircuitParts(handler *StreamHandler, circuitID string, timeout time.Duration, parts ...[]byte) error {
+	handler.writeMu.Lock()
+	defer handler.writeMu.Unlock()
+
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return writeCircuitPartsUnlocked(handler.stream, circuitID, timeout, parts...)
+}
+
+func writeCircuitPartsUnlocked(stream network.Stream, circuitID string, timeout time.Duration, parts ...[]byte) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	for _, part := range parts {
+		data := part
+		for len(data) > 0 {
+			chunk := data
+			if len(chunk) > maxCircuitWriteChunk {
+				chunk = chunk[:maxCircuitWriteChunk]
+			}
+			_ = stream.SetWriteDeadline(time.Now().Add(timeout))
+			n, err := stream.Write(chunk)
+			if err != nil {
+				_ = stream.SetWriteDeadline(time.Time{})
+				return err
+			}
+			if n <= 0 {
+				_ = stream.SetWriteDeadline(time.Time{})
+				return fmt.Errorf("short write on circuit %s", circuitID)
+			}
+			data = data[n:]
+		}
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+	return nil
 }
 
 // CloseCircuit closes the stream associated with circuitID and marks the

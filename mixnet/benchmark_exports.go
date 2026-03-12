@@ -85,6 +85,7 @@ func (m *Mixnet) ForceCloseForTest() {
 	if m.circuitMgr != nil {
 		_ = m.circuitMgr.Close()
 	}
+	m.clearAllStreamSessions()
 	if m.destHandler != nil {
 		m.destHandler.mu.Lock()
 		for sessionID := range m.destHandler.sessions {

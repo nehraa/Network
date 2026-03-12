@@ -37,7 +37,7 @@ func parseOptions() (suiteOptions, error) {
 		circuits  = flag.String("circuits", "", "comma-separated circuit counts (overrides profile)")
 		runs      = flag.Int("runs", 0, "runs per scenario and size (overrides profile)")
 		groups    = flag.String("groups", "", "comma-separated benchmark groups (overrides profile)")
-		timeout   = flag.Duration("timeout", 2*time.Minute, "per-run timeout")
+		timeout   = flag.Duration("timeout", 0, "per-run timeout (default depends on selected sizes)")
 	)
 	flag.Parse()
 

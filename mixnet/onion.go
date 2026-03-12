@@ -79,7 +79,7 @@ func encodeEncryptedFrame(circuitID string, payload []byte) ([]byte, error) {
 	return encodeEncryptedFrameWithVersion(circuitID, frameVersionFullOnion, payload)
 }
 
-func encodeEncryptedFrameWithVersion(circuitID string, version byte, payload []byte) ([]byte, error) {
+func buildEncryptedFrameHeader(circuitID string, version byte, payloadLen int) ([]byte, error) {
 	if len(circuitID) == 0 || len(circuitID) > 255 {
 		return nil, fmt.Errorf("invalid circuit id")
 	}
@@ -87,6 +87,14 @@ func encodeEncryptedFrameWithVersion(circuitID string, version byte, payload []b
 	header[0] = byte(len(circuitID))
 	copy(header[1:], []byte(circuitID))
 	header[1+len(circuitID)] = version
-	binary.LittleEndian.PutUint32(header[1+len(circuitID)+1:], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[1+len(circuitID)+1:], uint32(payloadLen))
+	return header, nil
+}
+
+func encodeEncryptedFrameWithVersion(circuitID string, version byte, payload []byte) ([]byte, error) {
+	header, err := buildEncryptedFrameHeader(circuitID, version, len(payload))
+	if err != nil {
+		return nil, err
+	}
 	return append(header, payload...), nil
 }

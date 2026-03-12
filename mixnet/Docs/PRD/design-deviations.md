@@ -145,7 +145,8 @@ THE Relay_Node SHALL forward the remaining encrypted payload to the next-hop pee
 ```
 
 ### Actual Implementation
-The implementation uses length-prefixed framing:
+The implementation uses length-prefixed framing, and the header-only mode now
+uses a stream-through relay path:
 
 ```go
 // Write length prefix
@@ -153,6 +154,14 @@ binary.Write(stream, binary.BigEndian, uint32(len(shard)))
 // Write shard data
 stream.Write(shard)
 ```
+
+For `header-only` forwarding specifically, the relay:
+
+1. Reads the frame header and encrypted onion header
+2. Decrypts only the routing/control header
+3. Rewrites only the header portion for the next hop
+4. Streams the remaining payload bytes to the outbound stream without
+   rebuilding a second full payload buffer
 
 ### Rationale
 **Why the deviation:**
@@ -165,6 +174,7 @@ stream.Write(shard)
 - ✅ Proper message framing
 - ✅ Better error detection
 - ✅ Enables stream reuse
+- ✅ Header-only relays no longer make a fresh full payload copy per hop
 - ❌ 4 bytes overhead per shard
 - ❌ Slight buffering (length prefix must be read first)
 
