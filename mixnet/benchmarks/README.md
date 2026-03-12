@@ -6,6 +6,7 @@ This benchmark suite runs entirely on local libp2p hosts. It does not use Docker
 
 - Direct libp2p baseline over Noise.
 - Header-only onion and full onion transport latency.
+- Legacy versus session-routed mixnet wire behavior.
 - CES pipeline cost by data size.
 - Hop-count sweep.
 - Parallel-circuit sweep.
@@ -29,6 +30,28 @@ The benchmarked header-only path reflects the current relay implementation:
 That means the header-only numbers include end-to-end session crypto and
 destination reconstruction, but they no longer include repeated relay-side
 payload-copy overhead that existed in the older buffered forwarding path.
+
+## Quick profile matrix
+
+The quick profile is now a single routed-stream comparison for
+`2 hops / 1 circuit` with fixed `256KB` application writes.
+
+It compares:
+
+- direct libp2p baseline
+- header-only mixnet with `EnableSessionRouting=true`
+- full onion mixnet with `EnableSessionRouting=true`
+
+The default quick sizes are:
+
+- `16MB,32MB,64MB,128MB,256MB`
+
+The report focuses on:
+
+- one latency graph
+- one throughput graph
+- one latency table with exact mean ms plus percent overhead
+- one throughput table with exact MiB/s plus retained-vs-direct percentages
 
 ## Raw data and outlier rule
 
@@ -89,6 +112,8 @@ Every run writes a timestamped directory under `mixnet/benchmarks/output/` with:
 - `graphs/*.svg`
 
 `report.html` links the generated graphs and summarizes the best hop x circuit combinations per size.
+For the quick profile it includes the routed comparison charts and the compact
+latency/throughput tables described above.
 
 ## Notes
 

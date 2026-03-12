@@ -38,18 +38,10 @@ type reportGraph struct {
 }
 
 type comparisonTable struct {
-	Title string
-	Rows  []comparisonRow
-}
-
-type comparisonRow struct {
-	SizeLabel       string
-	BaseMS          float64
-	HeaderMS        float64
-	HeaderVsBasePct float64
-	FullMS          float64
-	FullVsBasePct   float64
-	HeaderVsFullPct float64
+	Title       string
+	Description string
+	Headers     []string
+	Rows        [][]string
 }
 
 func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord, best []bestRecord) error {
@@ -76,13 +68,23 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	}
 
 	if opts.Profile == "quick" {
-		if err := addChart("Quick profile: baseline vs header-only vs full onion (2 hops, 1 circuit)", "graphs/quick_c1_latency.svg", "Mean total latency (ms)",
+		if err := addChart("Quick routed stream latency (256KB writes, 2 hops, 1 circuit)", "graphs/quick_c1_latency.svg", "Mean total latency (ms)",
 			[]chartSeries{
-				rawChartSeries("Direct baseline", "#1f77b4", lookup, "focused-direct-baseline"),
-				rawChartSeries("Header-only 2 hops 1 circuit", "#ff7f0e", lookup, "focused-header-only-c1"),
-				rawChartSeries("Full onion 2 hops 1 circuit", "#d62728", lookup, "focused-full-c1"),
+				rawChartSeries("Direct stream", "#1f77b4", lookup, "focused-direct-baseline"),
+				rawChartSeries("Header-only", "#2ca02c", lookup, "focused-header-only-c1-routed"),
+				rawChartSeries("Full onion", "#9467bd", lookup, "focused-full-c1-routed"),
 			},
 			func(summary summaryRecord) float64 { return summary.TotalMeanMS },
+		); err != nil {
+			return err
+		}
+		if err := addChart("Quick routed stream throughput (256KB writes, 2 hops, 1 circuit)", "graphs/quick_c1_throughput.svg", "Mean throughput (MiB/s)",
+			[]chartSeries{
+				rawChartSeries("Direct stream", "#1f77b4", lookup, "focused-direct-baseline"),
+				rawChartSeries("Header-only", "#2ca02c", lookup, "focused-header-only-c1-routed"),
+				rawChartSeries("Full onion", "#9467bd", lookup, "focused-full-c1-routed"),
+			},
+			func(summary summaryRecord) float64 { return summary.ThroughputMeanMBps },
 		); err != nil {
 			return err
 		}
@@ -91,6 +93,8 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	adjustmentNote := ""
 	if opts.Profile == "full" {
 		adjustmentNote = "Full runs do not generate graphs. Use raw_runs.csv and summary.csv for the full data dump, including CES scenarios."
+	} else if opts.Profile == "quick" {
+		adjustmentNote = "Quick uses fixed 256KB application writes and compares direct libp2p against header-only and full-onion mixnet with session routing enabled at 2 hops and 1 circuit. The tables below show exact latency and throughput values plus percent deltas."
 	}
 	data := reportData{
 		Profile:     opts.Profile,
@@ -161,20 +165,15 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
   {{range .Comparisons}}
   <div class="card">
     <h2>{{.Title}}</h2>
+    {{if .Description}}<p>{{.Description}}</p>{{end}}
     <table>
       <thead>
-        <tr><th>Size</th><th>Direct base ms</th><th>Header-only ms</th><th>Header vs base %</th><th>Full onion ms</th><th>Full vs base %</th><th>Header vs full %</th></tr>
+        <tr>{{range .Headers}}<th>{{.}}</th>{{end}}</tr>
       </thead>
       <tbody>
       {{range .Rows}}
         <tr>
-          <td>{{.SizeLabel}}</td>
-          <td>{{printf "%.3f" .BaseMS}}</td>
-          <td>{{printf "%.3f" .HeaderMS}}</td>
-          <td>{{printf "%.2f%%" .HeaderVsBasePct}}</td>
-          <td>{{printf "%.3f" .FullMS}}</td>
-          <td>{{printf "%.2f%%" .FullVsBasePct}}</td>
-          <td>{{printf "%.2f%%" .HeaderVsFullPct}}</td>
+          {{range .}}<td>{{.}}</td>{{end}}
         </tr>
       {{end}}
       </tbody>
@@ -379,6 +378,25 @@ func relativeToScenarioSeries(name, color string, lookup map[string][]summaryRec
 	}
 }
 
+func retainedThroughputSeries(name, color string, lookup map[string][]summaryRecord, scenarioID, baselineScenarioID string) chartSeries {
+	baselineBySize := make(map[int]float64)
+	for _, point := range lookup[baselineScenarioID] {
+		baselineBySize[point.SizeBytes] = point.ThroughputMeanMBps
+	}
+	return chartSeries{
+		Name:   name,
+		Color:  color,
+		Points: sortedPointsByID(lookup, scenarioID),
+		Value: func(summary summaryRecord) float64 {
+			baseline := baselineBySize[summary.SizeBytes]
+			if baseline <= 0 {
+				return 0
+			}
+			return percentOf(summary.ThroughputMeanMBps, baseline)
+		},
+	}
+}
+
 func relativeSeriesFromPoints(baselineBySize map[int]float64, items ...chartSeries) []chartSeries {
 	out := make([]chartSeries, 0, len(items))
 	for _, item := range items {
@@ -450,19 +468,36 @@ func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord)
 		return nil
 	}
 	return []comparisonTable{
-		buildComparisonTable(lookup, "Quick comparison: 2 hops, 1 circuit", "focused-direct-baseline", "focused-header-only-c1", "focused-full-c1"),
+		buildLatencyComparisonTable(
+			lookup,
+			"Quick routed stream latency comparison: 2 hops, 1 circuit",
+			"Exact mean total latency and percent overhead versus direct and versus the other mixnet mode.",
+			"focused-direct-baseline",
+			"focused-header-only-c1-routed",
+			"focused-full-c1-routed",
+		),
+		buildThroughputComparisonTable(
+			lookup,
+			"Quick routed stream throughput comparison: 2 hops, 1 circuit",
+			"Exact mean throughput and percent retention versus direct plus full-versus-header delta.",
+			"focused-direct-baseline",
+			"focused-header-only-c1-routed",
+			"focused-full-c1-routed",
+		),
 	}
 }
 
-func buildComparisonTable(lookup map[string][]summaryRecord, title, baselineID, headerID, fullID string) comparisonTable {
-	return buildComparisonTableFromMaps(title, summaryMapBySize(sortedPointsByID(lookup, baselineID)), summaryMapBySize(sortedPointsByID(lookup, headerID)), summaryMapBySize(sortedPointsByID(lookup, fullID)))
+func buildLatencyComparisonTable(lookup map[string][]summaryRecord, title, description, baselineID, headerID, fullID string) comparisonTable {
+	return buildLatencyComparisonTableFromMaps(
+		title,
+		description,
+		summaryMapBySize(sortedPointsByID(lookup, baselineID)),
+		summaryMapBySize(sortedPointsByID(lookup, headerID)),
+		summaryMapBySize(sortedPointsByID(lookup, fullID)),
+	)
 }
 
-func buildAdjustedComparisonTable(lookup map[string][]summaryRecord, title, baselineID, headerID, fullID, localID, cesLocalID string) comparisonTable {
-	return buildComparisonTableFromMaps(title, summaryMapBySize(sortedPointsByID(lookup, baselineID)), summaryMapBySize(adjustedSummaryPoints(lookup, headerID, localID, cesLocalID)), summaryMapBySize(adjustedSummaryPoints(lookup, fullID, localID, cesLocalID)))
-}
-
-func buildComparisonTableFromMaps(title string, baseBySize, headerBySize, fullBySize map[int]summaryRecord) comparisonTable {
+func buildLatencyComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord) comparisonTable {
 	sizes := make([]int, 0, len(baseBySize))
 	for size := range baseBySize {
 		if _, ok := headerBySize[size]; !ok {
@@ -475,23 +510,91 @@ func buildComparisonTableFromMaps(title string, baseBySize, headerBySize, fullBy
 	}
 	sort.Ints(sizes)
 
-	rows := make([]comparisonRow, 0, len(sizes))
+	rows := make([][]string, 0, len(sizes))
 	for _, size := range sizes {
 		base := baseBySize[size]
 		header := headerBySize[size]
 		full := fullBySize[size]
-		rows = append(rows, comparisonRow{
-			SizeLabel:       base.SizeLabel,
-			BaseMS:          base.TotalMeanMS,
-			HeaderMS:        header.TotalMeanMS,
-			HeaderVsBasePct: percentDelta(header.TotalMeanMS, base.TotalMeanMS),
-			FullMS:          full.TotalMeanMS,
-			FullVsBasePct:   percentDelta(full.TotalMeanMS, base.TotalMeanMS),
-			HeaderVsFullPct: percentDelta(header.TotalMeanMS, full.TotalMeanMS),
+		rows = append(rows, []string{
+			base.SizeLabel,
+			fmt.Sprintf("%.3f", base.TotalMeanMS),
+			fmt.Sprintf("%.3f", header.TotalMeanMS),
+			fmt.Sprintf("%.2f%%", percentDelta(header.TotalMeanMS, base.TotalMeanMS)),
+			fmt.Sprintf("%.3f", full.TotalMeanMS),
+			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, base.TotalMeanMS)),
+			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, header.TotalMeanMS)),
 		})
 	}
 
-	return comparisonTable{Title: title, Rows: rows}
+	return comparisonTable{
+		Title:       title,
+		Description: description,
+		Headers: []string{
+			"Size",
+			"Direct ms",
+			"Header-only ms",
+			"Header-only overhead vs direct %",
+			"Full onion ms",
+			"Full onion overhead vs direct %",
+			"Full vs header-only %",
+		},
+		Rows: rows,
+	}
+}
+
+func buildThroughputComparisonTable(lookup map[string][]summaryRecord, title, description, baselineID, headerID, fullID string) comparisonTable {
+	return buildThroughputComparisonTableFromMaps(
+		title,
+		description,
+		summaryMapBySize(sortedPointsByID(lookup, baselineID)),
+		summaryMapBySize(sortedPointsByID(lookup, headerID)),
+		summaryMapBySize(sortedPointsByID(lookup, fullID)),
+	)
+}
+
+func buildThroughputComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord) comparisonTable {
+	sizes := make([]int, 0, len(baseBySize))
+	for size := range baseBySize {
+		if _, ok := headerBySize[size]; !ok {
+			continue
+		}
+		if _, ok := fullBySize[size]; !ok {
+			continue
+		}
+		sizes = append(sizes, size)
+	}
+	sort.Ints(sizes)
+
+	rows := make([][]string, 0, len(sizes))
+	for _, size := range sizes {
+		base := baseBySize[size]
+		header := headerBySize[size]
+		full := fullBySize[size]
+		rows = append(rows, []string{
+			base.SizeLabel,
+			fmt.Sprintf("%.3f", base.ThroughputMeanMBps),
+			fmt.Sprintf("%.3f", header.ThroughputMeanMBps),
+			fmt.Sprintf("%.2f%%", percentOf(header.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			fmt.Sprintf("%.3f", full.ThroughputMeanMBps),
+			fmt.Sprintf("%.2f%%", percentOf(full.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			fmt.Sprintf("%.2f%%", percentDelta(full.ThroughputMeanMBps, header.ThroughputMeanMBps)),
+		})
+	}
+
+	return comparisonTable{
+		Title:       title,
+		Description: description,
+		Headers: []string{
+			"Size",
+			"Direct MiB/s",
+			"Header-only MiB/s",
+			"Header-only retained vs direct %",
+			"Full onion MiB/s",
+			"Full onion retained vs direct %",
+			"Full vs header-only %",
+		},
+		Rows: rows,
+	}
 }
 
 func percentDelta(value, baseline float64) float64 {
@@ -499,6 +602,13 @@ func percentDelta(value, baseline float64) float64 {
 		return 0
 	}
 	return ((value - baseline) / baseline) * 100.0
+}
+
+func percentOf(value, baseline float64) float64 {
+	if baseline == 0 {
+		return 0
+	}
+	return (value / baseline) * 100.0
 }
 
 func writeSVGLineChart(path, title, yLabel string, chartData []chartSeries, value func(summaryRecord) float64) error {

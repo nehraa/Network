@@ -23,6 +23,24 @@ In header-only mode the relay does not allocate and rebuild a second full copy
 of the shard payload at each hop. The only place that buffers and reconstructs
 the full session payload is the destination-side handler.
 
+## Session-routing forwarding model
+
+When `EnableSessionRouting` is enabled, relays also support an opt-in routed
+session cache:
+
+- the first setup frame on a `(baseSessionID, circuit)` decrypts routing state
+  once and installs a cache entry
+- later session-data frames on that same base session are forwarded using the
+  cached next-hop or final-hop delivery state
+- idle entries are cleared after `SessionRouteIdleTimeout`, and stream close
+  can clear them eagerly
+
+The cache is scoped to the relay's inbound authenticated libp2p stream from the
+previous hop. That prevents unrelated peers from sharing routed-session state.
+It does not yet add a relay-side MAC for routed data frames, so a malicious
+adjacent upstream relay can still cause forwarding attempts until the
+destination rejects tampered data.
+
 ## Operating a Relay
 
 To operate a relay, a node simply needs to register the Lib-Mix protocol handler and advertise its capability in the DHT.
