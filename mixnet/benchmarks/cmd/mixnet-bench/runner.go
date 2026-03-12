@@ -235,7 +235,7 @@ func profileOptions(name string) (suiteOptions, error) {
 	case "quick":
 		return suiteOptions{
 			Profile:     name,
-			SizeSpec:    "16MB,32MB,64MB,128MB,256MB",
+			SizeSpec:    "16MB,32MB,64MB,128MB,256MB,512MB,1GB",
 			HopSpec:     "2",
 			CircuitSpec: "1",
 			GroupSpec:   groupFocusedOnion,
