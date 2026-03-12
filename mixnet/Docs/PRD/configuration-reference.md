@@ -18,6 +18,11 @@ control four different concerns:
 The available flags exist so operators can tune those trade-offs explicitly
 instead of being forced into a single privacy/performance profile.
 
+Use `DefaultConfig()` when you want a ready-to-run baseline. Use
+`NewMixnetConfig()` when you want to build the config manually from near-zero
+values and then call `InitDefaults()` or set every field yourself before
+validation.
+
 ## Flags, purpose, and benefit at a glance
 
 ### Routing and path construction flags
@@ -36,8 +41,11 @@ instead of being forced into a single privacy/performance profile.
 | --- | --- | --- | --- | --- |
 | `Compression` | `gzip`, `snappy` | Compresses data before encryption/sharding when CES is enabled. | Compression reduces bytes sent and can lower shard count for compressible data. | `gzip` was chosen as the default because it prioritizes better size reduction out of the box. |
 | `UseCESPipeline` | `true`, `false` | Enables or bypasses the Compress-Encrypt-Shard pipeline. | CES improves redundancy and makes multi-path delivery more effective. | `true` keeps the default behavior aligned with the full Lib-Mix design rather than the reduced fast path. |
+| `UseCSE` | `true`, `false` | Enables the non-CES Compress-Shard-Encrypt fast path. | Lets multi-circuit receivers decrypt shards independently on arrival. | `false` keeps the default behavior centered on the main CES and non-CSE flows until CSE is explicitly requested. |
 | `ErasureThreshold` | `1..CircuitCount`, or `0` for auto | Controls how many shards must arrive before reconstruction can succeed. | Lower thresholds tolerate loss; higher thresholds reduce reconstruction ambiguity and overhead. | `0` lets the implementation derive `ceil(CircuitCount * 0.6)`, which is a balanced recovery threshold for most deployments. |
 | `EncryptionMode` | `full`, `header-only` | Chooses whether each hop decrypts only routing headers or the entire payload layer. | Gives operators a way to reduce per-hop CPU cost for large payloads. | `full` is the default because it favors stronger layered protection over throughput optimizations. |
+| `EnableSessionRouting` | `true`, `false` | Enables setup-once/data-later session routing for header-only repeated writes and reused sessions. | Reused header-only streams avoid repeating route/setup work on every write. | `false` preserves the existing wire behavior until deployments opt in explicitly. |
+| `SessionRouteIdleTimeout` | duration, `>= 0` | Controls how long routed-session state is cached when idle. | Bounds memory/state lifetime while still allowing setup reuse across nearby writes. | `30s` allows short pauses in stream writes without keeping routed state forever. |
 
 ### Traffic-analysis resistance flags
 
@@ -156,6 +164,19 @@ instead of being forced into a single privacy/performance profile.
   - ❌ No redundancy (all circuits must succeed)
 - **Requirement**: Req 21
 
+### `UseCSE`
+- **Type**: `bool`
+- **Default**: `false`
+- **Description**: Enables the non-CES Compress-Shard-Encrypt path
+- **When to Enable**:
+  - multi-circuit receivers that benefit from decrypting each shard as it arrives
+  - workloads where the full CES pipeline is not desired but per-shard handling still is
+- **Impact When Enabled**:
+  - ✅ avoids the full CES pipeline while keeping a shard-oriented fast path
+  - ✅ can improve multi-write and multi-circuit stream behavior for some workloads
+  - ❌ is a narrower specialized mode than the default CES path
+  - ❌ should be benchmarked explicitly for the application's payload pattern
+
 ### `EncryptionMode`
 - **Type**: `EncryptionMode` (enum)
 - **Values**: `"full"`, `"header-only"`
@@ -167,6 +188,35 @@ instead of being forced into a single privacy/performance profile.
   - Acceptable to encrypt payload once end-to-end
 - **Performance Impact**: Header-only is 2-5× faster for large payloads
 - **Requirement**: Req 3A
+
+### `EnableSessionRouting`
+- **Type**: `bool`
+- **Default**: `false`
+- **Description**: Enables the opt-in setup-once/data-later wire mode for
+  repeated header-only `MixStream.Write` calls and reused `SendWithSession`
+  base sessions
+- **When to Enable**:
+  - long-lived streams with many writes
+  - repeated `SendWithSession` calls that intentionally reuse a base session ID
+  - profiles where repeating route/setup work per write is the dominant cost
+- **Impact When Enabled**:
+  - ✅ avoids re-sending full route/setup material on every later write
+  - ✅ lets relays reuse cached next-hop or final-hop state
+  - ❌ shifts some route privacy cost to the initial setup only
+  - ❌ requires peers on the path to support the new mixnet-internal frame type
+  - ❌ does not apply to full onion, which stays on the legacy per-frame onion path
+
+### `SessionRouteIdleTimeout`
+- **Type**: `time.Duration`
+- **Default**: `30 seconds`
+- **Description**: Idle timeout for sender, relay, and destination
+  session-routing state
+- **When to Adjust**:
+  - decrease to reclaim routed-session state more aggressively
+  - increase when applications pause between writes but still want to reuse the
+    same routed session
+- **Recommendation**: Keep it low enough to bound stale state, but high enough
+  to cover the application's normal pause between stream writes
 
 ---
 
@@ -237,13 +287,16 @@ instead of being forced into a single privacy/performance profile.
   - Debugging integrity issues
 - **Performance Impact**: +16 bytes per shard, +HMAC computation
 - **Requirement**: Req 24
+- **Note for session-routing**: Auth tags improve destination-side tamper
+  detection for routed session-data frames, but they do not give relays a
+  separate source-authentication check before forwarding.
 
 ### `AuthTagSize`
 - **Type**: `int`
 - **Default**: 16
 - **Description**: Size of truncated HMAC tag in bytes
 - **Recommendation**: 16 bytes (128 bits) is sufficient
-- **Security**: Don't go below 12 bytes (96 bits)
+- **Validation**: The implementation accepts 1-32 bytes, though 12+ bytes is the safer practical range
 
 ---
 
@@ -264,25 +317,58 @@ instead of being forced into a single privacy/performance profile.
 
 ---
 
-## Relay Configuration
+## Relay Resource Configuration
 
-### `MaxCircuits`
+These settings live on `ResourceConfig`, not `MixnetConfig`, and are used with
+`NewMixnetWithResources`.
+
+### `MaxConcurrentCircuits`
 - **Type**: `int`
 - **Default**: 100
-- **Description**: Maximum concurrent circuits for relay nodes
+- **Description**: Maximum number of concurrently tracked relay circuits
 - **When to Adjust**:
-  - Increase for high-capacity relays
-  - Decrease for resource-constrained nodes
-- **Requirement**: Req 20, Req 26
+  - increase for high-capacity relay nodes
+  - decrease for resource-constrained relays
 
-### `MaxBandwidth`
+### `MaxBandwidthBytesPerSec`
 - **Type**: `int64` (bytes/sec)
-- **Default**: 10485760 (10 MB/s)
-- **Description**: Maximum bandwidth per circuit
+- **Default**: 1048576 (1 MiB/s)
+- **Description**: Total relay bandwidth budget enforced by the resource manager
 - **When to Adjust**:
-  - Increase for high-bandwidth relays
-  - Decrease to prevent abuse
-- **Requirement**: Req 20, Req 26
+  - increase for higher-throughput relays
+  - decrease to constrain abuse or lab environments
+
+### `MaxConnectionsPerPeer`
+- **Type**: `int`
+- **Default**: 10
+- **Description**: Limits concurrent resource-tracked connections from a single peer
+
+### `CircuitTimeout`
+- **Type**: `time.Duration`
+- **Default**: 30 minutes
+- **Description**: Idle timeout before relay-side resource cleanup reclaims a circuit
+
+### `EnableBackpressure`
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: Emits backpressure when the resource manager reaches configured limits
+
+---
+
+## Configuration lifecycle helpers
+
+The config type also exposes lifecycle and helper methods that affect how you
+customize it:
+
+- `Set*` methods update fields while the config is still mutable.
+- `InitDefaults()` fills in any still-unset fields with implementation defaults.
+- `GetErasureThreshold()` and `GetSamplingSize()` return derived effective values.
+- `Lock()` marks the config immutable.
+- `IsLocked()` reports whether later mutation attempts will fail.
+- `ErrConfigImmutable` is returned by setters after the runtime locks the config.
+
+In practice, callers usually finish configuration before establishing circuits.
+After circuits are active, treat the config as read-only.
 
 ---
 
@@ -332,7 +418,10 @@ config := &MixnetConfig{
     Compression:            "gzip",
     ErasureThreshold:       1,
     UseCESPipeline:         false,
+    UseCSE:                 false,
     EncryptionMode:         "header-only",
+    EnableSessionRouting:   true,
+    SessionRouteIdleTimeout: 15 * time.Second,
     SelectionMode:          "rtt",
     PayloadPaddingStrategy: "none",
     MaxJitter:              0,
@@ -348,12 +437,15 @@ config := &MixnetConfig{
     Compression:            "gzip",
     ErasureThreshold:       2,
     UseCESPipeline:         true,
+    UseCSE:                 false,
     EncryptionMode:         "full",
     SelectionMode:          "rtt",
     HeaderPaddingEnabled:   true,
     HeaderPaddingMin:       16,
     HeaderPaddingMax:       256,
     PayloadPaddingStrategy: "none",
+    EnableSessionRouting:   false,
+    SessionRouteIdleTimeout: 30 * time.Second,
     MaxJitter:              50,
 }
 ```
@@ -367,6 +459,7 @@ config := &MixnetConfig{
     Compression:            "gzip",
     ErasureThreshold:       3,
     UseCESPipeline:         true,
+    UseCSE:                 false,
     EncryptionMode:         "full",
     SelectionMode:          "hybrid",
     RandomnessFactor:       0.5,
@@ -376,6 +469,8 @@ config := &MixnetConfig{
     PayloadPaddingBuckets:  []int{1024, 4096, 16384, 65536},
     EnableAuthTag:          true,
     AuthTagSize:            16,
+    EnableSessionRouting:   false,
+    SessionRouteIdleTimeout: 30 * time.Second,
     MaxJitter:              100,
 }
 ```
@@ -389,7 +484,10 @@ config := &MixnetConfig{
     Compression:            "gzip",
     ErasureThreshold:       3,
     UseCESPipeline:         true,
+    UseCSE:                 false,
     EncryptionMode:         "header-only",
+    EnableSessionRouting:   true,
+    SessionRouteIdleTimeout: 30 * time.Second,
     SelectionMode:          "rtt",
     PayloadPaddingStrategy: "none",
     MaxJitter:              0,
@@ -410,8 +508,9 @@ The implementation validates configuration at initialization:
 5. **HeaderPaddingMin**: Must be ≤ `HeaderPaddingMax`
 6. **PayloadPaddingMin**: Must be ≤ `PayloadPaddingMax`
 7. **PayloadPaddingBuckets**: Must be in ascending order
-8. **AuthTagSize**: Must be 12-32 bytes
+8. **AuthTagSize**: Must be 1-32 bytes
 9. **MaxJitter**: Must be ≥ 0
+10. **SessionRouteIdleTimeout**: Must be ≥ 0
 
 Invalid configurations return an error immediately.
 
@@ -430,14 +529,19 @@ Invalid configurations return an error immediately.
 
 ## Monitoring Configuration Impact
 
-Use the MetricsCollector to monitor how configuration affects performance:
+Use the runtime metrics collector to monitor how configuration affects performance:
 
 ```go
-metrics := mixnet.GetMetrics()
-fmt.Printf("Avg Circuit RTT: %v\n", metrics.AvgCircuitRTT)
-fmt.Printf("Compression Ratio: %.2f\n", metrics.CompressionRatio)
-fmt.Printf("Circuit Success Rate: %.2f%%\n", metrics.ConstructionSuccessRate * 100)
+metrics := m.Metrics()
+fmt.Printf("Avg Circuit RTT: %v\n", metrics.AverageRTT())
+fmt.Printf("Compression Ratio: %.2f\n", metrics.CompressionRatio())
+fmt.Printf("Circuit Success Rate: %.2f%%\n", metrics.CircuitSuccessRate()*100)
 ```
+
+For integrations that want HTTP exposure, `MetricsHandler()` and
+`StartMetricsEndpoint()` expose the same runtime metrics as a handler or server.
+If `LIBP2P_MIXNET_METRICS_ADDR` is set in the environment, the runtime will
+attempt to start that endpoint automatically.
 
 Adjust configuration based on metrics:
 - High RTT → Reduce `HopCount` or use `SelectionMode: "rtt"`

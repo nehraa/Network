@@ -6,6 +6,7 @@ This benchmark suite runs entirely on local libp2p hosts. It does not use Docker
 
 - Direct libp2p baseline over Noise.
 - Header-only onion and full onion transport latency.
+- Legacy versus session-routed mixnet wire behavior.
 - CES pipeline cost by data size.
 - Hop-count sweep.
 - Parallel-circuit sweep.
@@ -29,6 +30,68 @@ The benchmarked header-only path reflects the current relay implementation:
 That means the header-only numbers include end-to-end session crypto and
 destination reconstruction, but they no longer include repeated relay-side
 payload-copy overhead that existed in the older buffered forwarding path.
+
+## Quick profile matrix
+
+The quick profile is now a single routed-stream comparison for
+`2 hops / 1 circuit` with fixed `256KB` application writes.
+
+It compares:
+
+- direct libp2p baseline
+- header-only mixnet with `EnableSessionRouting=true`
+- full onion mixnet on the legacy per-frame path
+
+The default quick sizes are:
+
+- `16MB,32MB,64MB,128MB,256MB,512MB,1GB`
+
+The report focuses on:
+
+- one latency graph
+- one throughput graph
+- one latency table with exact mean ms plus percent overhead
+- one throughput table with exact MiB/s plus throughput delta vs direct
+- audio preset latency and throughput tables
+- video preset latency and throughput tables
+
+Session-routing is benchmarked only for header-only in quick. Full onion stays
+on the legacy per-hop decrypt path so the comparison reflects the intended
+behavior difference.
+
+Quick also includes media-style stream presets. These do not pace traffic in
+real time; instead they shape each run using a bitrate-derived write size and a
+fixed virtual stream payload:
+
+| Kind | Quality | Bitrate | Segment | Duration | Derived payload |
+| --- | --- | --- | --- | --- | --- |
+| audio | low | 96 kbps | 1000 ms | 30 s | about 352 KB |
+| audio | medium | 192 kbps | 1000 ms | 30 s | about 703 KB |
+| audio | high | 320 kbps | 1000 ms | 30 s | about 1.14 MB |
+| video | 480p | 1500 kbps | 1000 ms | 60 s | about 10.7 MB |
+| video | 720p | 4000 kbps | 1000 ms | 60 s | about 28.6 MB |
+| video | 1080p | 8000 kbps | 1000 ms | 60 s | about 57.2 MB |
+
+If you enable the optional visual proof output, the runner performs a separate
+64KB live proof capture after the timed quick scenarios finish for:
+
+- header-only mixnet with `EnableSessionRouting=true`
+- full onion mixnet on the legacy path
+
+This proof run is not included in the benchmark timings. It exists only to
+record what each hop, the destination network handler, and the destination
+application actually observed in one real run. The output is written as
+separate files:
+
+- `visual_proof.txt`
+- `visual_proof.json`
+- matching proof tables inside `report.html`
+
+Enable that extra step with:
+
+```bash
+go run ./mixnet/benchmarks/cmd/mixnet-bench --profile quick --visual-proof
+```
 
 ## Raw data and outlier rule
 
@@ -88,7 +151,14 @@ Every run writes a timestamped directory under `mixnet/benchmarks/output/` with:
 - `report.html`
 - `graphs/*.svg`
 
+When `--visual-proof` is enabled, the run also writes:
+
+- `visual_proof.txt`
+- `visual_proof.json`
+
 `report.html` links the generated graphs and summarizes the best hop x circuit combinations per size.
+For the quick profile it includes the routed comparison charts and the compact
+latency/throughput tables described above.
 
 ## Notes
 

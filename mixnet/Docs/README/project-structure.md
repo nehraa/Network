@@ -38,6 +38,7 @@ mixnet/
 | `privacy_transport.go` | Defines the transport message format, shard metadata, and destination-side shard parsing/reassembly helpers. |
 | `relay_discovery.go` | Connects the main `Mixnet` runtime to the relay discovery package and optional cover-traffic helpers. |
 | `resource_management.go` | Enforces relay resource limits and integrates those limits with the mixnet runtime. |
+| `session_routing.go` | Defines the opt-in session-routing setup/data/close frames and helpers for base-session reuse. |
 | `session_crypto.go` | Encrypts and decrypts the end-to-end session payload carried inside shards. |
 | `stream.go` | Provides the stream-style API exposed to applications (`OpenStream`, `AcceptStream`, `Read`, `Write`, `Close`). |
 | `stream_upgrader.go` | Defines the stream upgrader abstraction used by callers that want a dedicated upgrade API. |

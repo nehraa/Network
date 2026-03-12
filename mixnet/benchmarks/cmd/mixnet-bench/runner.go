@@ -86,6 +86,7 @@ type suiteOptions struct {
 	Circuits    []int
 	Groups      map[string]bool
 	Runs        int
+	VisualProof bool
 	// SizeRunOverrides allows a per-size run count override (bytes -> runs).
 	SizeRunOverrides map[int]int
 	Timeout          time.Duration
@@ -97,6 +98,15 @@ type scenario struct {
 	Label                  string
 	Mode                   string
 	Measurement            string
+	StreamProfile          string
+	StreamKind             string
+	StreamQuality          string
+	StreamWrites           bool
+	StreamBitrateKbps      int
+	StreamSegmentMS        int
+	StreamDurationSec      int
+	StreamWriteSizeBytes   int
+	EnableSessionRouting   bool
 	HopCount               int
 	CircuitCount           int
 	UseCESPipeline         bool
@@ -116,6 +126,7 @@ type scenario struct {
 	EnableAuthTag          bool
 	AuthTagSize            int
 	MaxJitter              int
+	Sizes                  []int
 }
 
 type runRecord struct {
@@ -124,6 +135,15 @@ type runRecord struct {
 	Label                   string    `json:"label"`
 	Measurement             string    `json:"measurement"`
 	Mode                    string    `json:"mode"`
+	StreamProfile           string    `json:"stream_profile"`
+	StreamKind              string    `json:"stream_kind"`
+	StreamQuality           string    `json:"stream_quality"`
+	StreamWrites            bool      `json:"stream_writes"`
+	StreamBitrateKbps       int       `json:"stream_bitrate_kbps"`
+	StreamSegmentMS         int       `json:"stream_segment_ms"`
+	StreamDurationSec       int       `json:"stream_duration_sec"`
+	StreamWriteSizeBytes    int       `json:"stream_write_size_bytes"`
+	EnableSessionRouting    bool      `json:"enable_session_routing"`
 	SizeBytes               int       `json:"size_bytes"`
 	SizeLabel               string    `json:"size_label"`
 	RunIndex                int       `json:"run_index"`
@@ -159,6 +179,15 @@ type summaryRecord struct {
 	Label                   string  `json:"label"`
 	Measurement             string  `json:"measurement"`
 	Mode                    string  `json:"mode"`
+	StreamProfile           string  `json:"stream_profile"`
+	StreamKind              string  `json:"stream_kind"`
+	StreamQuality           string  `json:"stream_quality"`
+	StreamWrites            bool    `json:"stream_writes"`
+	StreamBitrateKbps       int     `json:"stream_bitrate_kbps"`
+	StreamSegmentMS         int     `json:"stream_segment_ms"`
+	StreamDurationSec       int     `json:"stream_duration_sec"`
+	StreamWriteSizeBytes    int     `json:"stream_write_size_bytes"`
+	EnableSessionRouting    bool    `json:"enable_session_routing"`
 	SizeBytes               int     `json:"size_bytes"`
 	SizeLabel               string  `json:"size_label"`
 	HopCount                int     `json:"hop_count"`
@@ -195,6 +224,25 @@ type summaryRecord struct {
 	ThroughputStdDevMBps    float64 `json:"throughput_stddev_mib_per_s"`
 }
 
+type streamWorkloadPreset struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Quality     string `json:"quality"`
+	Label       string `json:"label"`
+	BitrateKbps int    `json:"bitrate_kbps"`
+	SegmentMS   int    `json:"segment_ms"`
+	DurationSec int    `json:"duration_sec"`
+}
+
+var quickMediaProfiles = []streamWorkloadPreset{
+	{ID: "audio-low", Kind: "audio", Quality: "low", Label: "Audio low", BitrateKbps: 96, SegmentMS: 1000, DurationSec: 30},
+	{ID: "audio-medium", Kind: "audio", Quality: "medium", Label: "Audio medium", BitrateKbps: 192, SegmentMS: 1000, DurationSec: 30},
+	{ID: "audio-high", Kind: "audio", Quality: "high", Label: "Audio high", BitrateKbps: 320, SegmentMS: 1000, DurationSec: 30},
+	{ID: "video-480p", Kind: "video", Quality: "480p", Label: "Video 480p", BitrateKbps: 1500, SegmentMS: 1000, DurationSec: 60},
+	{ID: "video-720p", Kind: "video", Quality: "720p", Label: "Video 720p", BitrateKbps: 4000, SegmentMS: 1000, DurationSec: 60},
+	{ID: "video-1080p", Kind: "video", Quality: "1080p", Label: "Video 1080p", BitrateKbps: 8000, SegmentMS: 1000, DurationSec: 60},
+}
+
 type bestRecord struct {
 	Mode            string  `json:"mode"`
 	SizeBytes       int     `json:"size_bytes"`
@@ -215,6 +263,14 @@ type staticRouting struct {
 	peers     map[peer.ID]peer.AddrInfo
 }
 
+type benchmarkNetwork struct {
+	origin    *mixnet.Mixnet
+	dest      *mixnet.Mixnet
+	relays    []*mixnet.Mixnet
+	cleanup   func()
+	relayHost []host.Host
+}
+
 func profileOptions(name string) (suiteOptions, error) {
 	switch name {
 	case "smoke":
@@ -229,7 +285,7 @@ func profileOptions(name string) (suiteOptions, error) {
 	case "quick":
 		return suiteOptions{
 			Profile:     name,
-			SizeSpec:    "16MB,32MB,64MB,128MB,256MB,512MB",
+			SizeSpec:    "16MB,32MB,64MB,128MB,256MB,512MB,1GB",
 			HopSpec:     "2",
 			CircuitSpec: "1",
 			GroupSpec:   groupFocusedOnion,
@@ -315,14 +371,16 @@ func runSuite(opts suiteOptions) error {
 		opts.Profile, len(scenarios), len(opts.Sizes), opts.runsSummary(), opts.OutputDir)
 
 	totalWork := 0
-	for _, size := range opts.Sizes {
-		totalWork += len(scenarios) * opts.runsForSize(size)
+	for _, sc := range scenarios {
+		for _, size := range scenarioSizes(opts, sc) {
+			totalWork += opts.runsForSize(size)
+		}
 	}
 	runRecords := make([]*runRecord, 0, totalWork)
 	workIndex := 0
 
 	for _, sc := range scenarios {
-		for _, size := range opts.Sizes {
+		for _, size := range scenarioSizes(opts, sc) {
 			runs := opts.runsForSize(size)
 			for runIdx := 1; runIdx <= runs; runIdx++ {
 				workIndex++
@@ -355,12 +413,29 @@ func runSuite(opts suiteOptions) error {
 	if err := writeBestRecords(opts.OutputDir, best); err != nil {
 		return err
 	}
+
+	if opts.VisualProof && opts.Profile == "quick" {
+		proofs, proofErr := runQuickVisualProof(opts)
+		if proofErr != nil {
+			return proofErr
+		}
+		if err := writeVisualProofFiles(opts.OutputDir, proofs); err != nil {
+			return err
+		}
+	}
 	if err := writeReport(opts.OutputDir, opts, summaries, best); err != nil {
 		return err
 	}
 
 	fmt.Printf("mixnet-bench: complete. report=%s\n", filepath.Join(opts.OutputDir, "report.html"))
 	return nil
+}
+
+func scenarioSizes(opts suiteOptions, sc scenario) []int {
+	if len(sc.Sizes) > 0 {
+		return sc.Sizes
+	}
+	return opts.Sizes
 }
 
 func releaseBenchmarkMemory() {
@@ -483,22 +558,27 @@ func buildScenarios(opts suiteOptions) []scenario {
 	}
 
 	if hasGroup(groupFocusedOnion) {
-		out = append(out, scenario{ID: "focused-direct-baseline", Category: groupFocusedOnion, Label: "Direct baseline", Mode: "direct", Measurement: measurementDirect})
+		out = append(out,
+			newDirectScenario("focused-direct-baseline", groupFocusedOnion, "Direct stream", true),
+		)
 		if opts.Profile == "quick" {
 			out = append(out,
-				newMixnetScenario("focused-header-only-c1", groupFocusedOnion, "Header-only 2 hops 1 circuit", "header-only", 2, 1, false),
-				newMixnetScenario("focused-full-c1", groupFocusedOnion, "Full onion 2 hops 1 circuit", "full", 2, 1, false),
+				newRoutedStreamMixnetScenario("focused-header-only-c1-routed", groupFocusedOnion, "Header-only routed stream 2 hops 1 circuit", "header-only", 2, 1, false),
+				newStreamMixnetScenario("focused-full-c1-legacy", groupFocusedOnion, "Full onion legacy stream 2 hops 1 circuit", "full", 2, 1, false),
 			)
+			for _, profile := range quickMediaProfiles {
+				out = append(out, newQuickMediaScenarios(groupFocusedOnion, profile)...)
+			}
 		} else {
 			out = append(out,
 				scenario{ID: "focused-local-c1", Category: groupFocusedOnion, Label: "Local session 1 circuit", Mode: "local", Measurement: measurementLocal, HopCount: 2, CircuitCount: 1},
 				scenario{ID: "focused-local-c3", Category: groupFocusedOnion, Label: "Local session 3 circuits", Mode: "local", Measurement: measurementLocal, HopCount: 2, CircuitCount: 3},
 				scenario{ID: "focused-ces-local-c1", Category: groupFocusedOnion, Label: "CES local 1 circuit", Mode: "pipeline", Measurement: measurementCES, HopCount: 2, CircuitCount: 1, UseCESPipeline: true, Compression: "gzip"},
 				scenario{ID: "focused-ces-local-c3", Category: groupFocusedOnion, Label: "CES local 3 circuits", Mode: "pipeline", Measurement: measurementCES, HopCount: 2, CircuitCount: 3, UseCESPipeline: true, Compression: "gzip"},
-				newMixnetScenario("focused-header-only-c1", groupFocusedOnion, "Header-only 2 hops 1 circuit", "header-only", 2, 1, false),
-				newMixnetScenario("focused-full-c1", groupFocusedOnion, "Full onion 2 hops 1 circuit", "full", 2, 1, false),
-				newMixnetScenario("focused-header-only-c3", groupFocusedOnion, "Header-only 2 hops 3 circuits", "header-only", 2, 3, false),
-				newMixnetScenario("focused-full-c3", groupFocusedOnion, "Full onion 2 hops 3 circuits", "full", 2, 3, false),
+				newStreamMixnetScenario("focused-header-only-c1", groupFocusedOnion, "Header-only legacy stream 2 hops 1 circuit", "header-only", 2, 1, false),
+				newStreamMixnetScenario("focused-full-c1", groupFocusedOnion, "Full onion legacy stream 2 hops 1 circuit", "full", 2, 1, false),
+				newStreamMixnetScenario("focused-header-only-c3", groupFocusedOnion, "Header-only legacy stream 2 hops 3 circuits", "header-only", 2, 3, false),
+				newStreamMixnetScenario("focused-full-c3", groupFocusedOnion, "Full onion legacy stream 2 hops 3 circuits", "full", 2, 3, false),
 				newMixnetScenario("focused-header-only-c1-ces", groupFocusedOnion, "Header-only 2 hops 1 circuit + CES", "header-only", 2, 1, true),
 				newMixnetScenario("focused-full-c1-ces", groupFocusedOnion, "Full onion 2 hops 1 circuit + CES", "full", 2, 1, true),
 				newMixnetScenario("focused-header-only-c3-ces", groupFocusedOnion, "Header-only 2 hops 3 circuits + CES", "header-only", 2, 3, true),
@@ -510,6 +590,93 @@ func buildScenarios(opts suiteOptions) []scenario {
 	}
 
 	return out
+}
+
+func mediaPayloadSizeBytes(profile streamWorkloadPreset) int {
+	bytesPerSecond := float64(profile.BitrateKbps*1000) / 8.0
+	return maxInt(1, int(math.Round(bytesPerSecond*float64(profile.DurationSec))))
+}
+
+func mediaWriteSizeBytes(profile streamWorkloadPreset) int {
+	bytesPerSecond := float64(profile.BitrateKbps*1000) / 8.0
+	return maxInt(1, int(math.Round(bytesPerSecond*float64(profile.SegmentMS)/1000.0)))
+}
+
+func quickMediaScenarioID(profile streamWorkloadPreset, variant string) string {
+	return fmt.Sprintf("focused-%s-%s", profile.ID, variant)
+}
+
+func newQuickMediaScenarios(category string, profile streamWorkloadPreset) []scenario {
+	sizeBytes := mediaPayloadSizeBytes(profile)
+	writeSize := mediaWriteSizeBytes(profile)
+	baseLabel := fmt.Sprintf("%s stream %s", profile.Label, formatBytes(sizeBytes))
+	base := scenario{
+		Category:             category,
+		StreamProfile:        profile.ID,
+		StreamKind:           profile.Kind,
+		StreamQuality:        profile.Quality,
+		StreamWrites:         true,
+		StreamBitrateKbps:    profile.BitrateKbps,
+		StreamSegmentMS:      profile.SegmentMS,
+		StreamDurationSec:    profile.DurationSec,
+		StreamWriteSizeBytes: writeSize,
+		Sizes:                []int{sizeBytes},
+	}
+	return []scenario{
+		{
+			ID:                   quickMediaScenarioID(profile, "direct"),
+			Label:                fmt.Sprintf("Direct %s", baseLabel),
+			Mode:                 "direct",
+			Measurement:          measurementDirect,
+			Category:             base.Category,
+			StreamProfile:        base.StreamProfile,
+			StreamKind:           base.StreamKind,
+			StreamQuality:        base.StreamQuality,
+			StreamWrites:         base.StreamWrites,
+			StreamBitrateKbps:    base.StreamBitrateKbps,
+			StreamSegmentMS:      base.StreamSegmentMS,
+			StreamDurationSec:    base.StreamDurationSec,
+			StreamWriteSizeBytes: base.StreamWriteSizeBytes,
+			Sizes:                append([]int(nil), base.Sizes...),
+		},
+		{
+			ID:                   quickMediaScenarioID(profile, "header-routed"),
+			Label:                fmt.Sprintf("Header-only routed %s", baseLabel),
+			Mode:                 "header-only",
+			Measurement:          measurementMixnet,
+			Category:             base.Category,
+			StreamProfile:        base.StreamProfile,
+			StreamKind:           base.StreamKind,
+			StreamQuality:        base.StreamQuality,
+			StreamWrites:         base.StreamWrites,
+			StreamBitrateKbps:    base.StreamBitrateKbps,
+			StreamSegmentMS:      base.StreamSegmentMS,
+			StreamDurationSec:    base.StreamDurationSec,
+			StreamWriteSizeBytes: base.StreamWriteSizeBytes,
+			EnableSessionRouting: true,
+			HopCount:             2,
+			CircuitCount:         1,
+			Sizes:                append([]int(nil), base.Sizes...),
+		},
+		{
+			ID:                   quickMediaScenarioID(profile, "full-legacy"),
+			Label:                fmt.Sprintf("Full onion legacy %s", baseLabel),
+			Mode:                 "full",
+			Measurement:          measurementMixnet,
+			Category:             base.Category,
+			StreamProfile:        base.StreamProfile,
+			StreamKind:           base.StreamKind,
+			StreamQuality:        base.StreamQuality,
+			StreamWrites:         base.StreamWrites,
+			StreamBitrateKbps:    base.StreamBitrateKbps,
+			StreamSegmentMS:      base.StreamSegmentMS,
+			StreamDurationSec:    base.StreamDurationSec,
+			StreamWriteSizeBytes: base.StreamWriteSizeBytes,
+			HopCount:             2,
+			CircuitCount:         1,
+			Sizes:                append([]int(nil), base.Sizes...),
+		},
+	}
 }
 
 func newMixnetScenario(id, category, label, mode string, hops, circuits int, useCES bool) scenario {
@@ -526,6 +693,29 @@ func newMixnetScenario(id, category, label, mode string, hops, circuits int, use
 		SelectionMode:    mixnet.SelectionModeRTT,
 		RandomnessFactor: 0.3,
 	}
+}
+
+func newDirectScenario(id, category, label string, streamWrites bool) scenario {
+	return scenario{
+		ID:           id,
+		Category:     category,
+		Label:        label,
+		Mode:         "direct",
+		Measurement:  measurementDirect,
+		StreamWrites: streamWrites,
+	}
+}
+
+func newStreamMixnetScenario(id, category, label, mode string, hops, circuits int, useCES bool) scenario {
+	sc := newMixnetScenario(id, category, label, mode, hops, circuits, useCES)
+	sc.StreamWrites = true
+	return sc
+}
+
+func newRoutedStreamMixnetScenario(id, category, label, mode string, hops, circuits int, useCES bool) scenario {
+	sc := newStreamMixnetScenario(id, category, label, mode, hops, circuits, useCES)
+	sc.EnableSessionRouting = true
+	return sc
 }
 
 func newCSEScenario(id, category, label, mode string, hops, circuits int) scenario {
@@ -554,6 +744,15 @@ func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*run
 		Label:                   sc.Label,
 		Measurement:             sc.Measurement,
 		Mode:                    sc.Mode,
+		StreamProfile:           sc.StreamProfile,
+		StreamKind:              sc.StreamKind,
+		StreamQuality:           sc.StreamQuality,
+		StreamWrites:            sc.StreamWrites,
+		StreamBitrateKbps:       sc.StreamBitrateKbps,
+		StreamSegmentMS:         sc.StreamSegmentMS,
+		StreamDurationSec:       sc.StreamDurationSec,
+		StreamWriteSizeBytes:    sc.StreamWriteSizeBytes,
+		EnableSessionRouting:    sc.EnableSessionRouting,
 		SizeBytes:               size,
 		SizeLabel:               formatBytes(size),
 		RunIndex:                runIdx,
@@ -657,7 +856,7 @@ func runDirectTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	}
 
 	transferStart := time.Now()
-	chunkSize := benchmarkIOChunkSize(len(wirePayload))
+	chunkSize := transferChunkSize(sc, len(wirePayload))
 	for offset := 0; offset < len(wirePayload); offset += chunkSize {
 		end := offset + chunkSize
 		if end > len(wirePayload) {
@@ -768,7 +967,7 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	defer originStream.Close()
 
 	transferStart := time.Now()
-	chunkSize := benchmarkIOChunkSize(len(wirePayload))
+	chunkSize := transferChunkSize(sc, len(wirePayload))
 	for offset := 0; offset < len(wirePayload); offset += chunkSize {
 		end := offset + chunkSize
 		if end > len(wirePayload) {
@@ -1151,6 +1350,16 @@ func benchmarkIOChunkSize(totalBytes int) int {
 	}
 }
 
+func transferChunkSize(sc scenario, totalBytes int) int {
+	if sc.StreamWriteSizeBytes > 0 {
+		return sc.StreamWriteSizeBytes
+	}
+	if sc.StreamWrites {
+		return benchmarkChunkSize
+	}
+	return benchmarkIOChunkSize(totalBytes)
+}
+
 func benchmarkReadBufferSize(expectedLen int) int {
 	return benchmarkIOChunkSize(expectedLen)
 }
@@ -1325,6 +1534,7 @@ func (s scenario) config() (*mixnet.MixnetConfig, error) {
 	cfg := mixnet.DefaultConfig()
 	cfg.HopCount = s.HopCount
 	cfg.CircuitCount = s.CircuitCount
+	cfg.EnableSessionRouting = s.EnableSessionRouting
 	cfg.UseCESPipeline = s.UseCESPipeline
 	cfg.UseCSE = s.UseCSE
 	cfg.Compression = fallbackCompression(s.Compression)
@@ -1354,14 +1564,22 @@ func (s scenario) config() (*mixnet.MixnetConfig, error) {
 }
 
 func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCount int) (*mixnet.Mixnet, *mixnet.Mixnet, func(), error) {
-	originHost, err := newBenchHost()
+	network, err := setupBenchmarkNetwork(ctx, cfg, relayCount)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	return network.origin, network.dest, network.cleanup, nil
+}
+
+func setupBenchmarkNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCount int) (*benchmarkNetwork, error) {
+	originHost, err := newBenchHost()
+	if err != nil {
+		return nil, err
 	}
 	destHost, err := newBenchHost()
 	if err != nil {
 		_ = originHost.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
 	relayHosts := make([]host.Host, relayCount)
 	for i := range relayHosts {
@@ -1374,7 +1592,7 @@ func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCoun
 			}
 			_ = originHost.Close()
 			_ = destHost.Close()
-			return nil, nil, nil, err
+			return nil, err
 		}
 		relayHosts[i] = h
 	}
@@ -1392,12 +1610,12 @@ func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCoun
 
 	origin, err := mixnet.NewMixnet(cloneConfig(cfg), originHost, &staticRouting{providers: providers, peers: peerMap})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("new origin mixnet: %w", err)
+		return nil, fmt.Errorf("new origin mixnet: %w", err)
 	}
 	dest, err := mixnet.NewMixnet(cloneConfig(cfg), destHost, nil)
 	if err != nil {
 		origin.ForceCloseForTest()
-		return nil, nil, nil, fmt.Errorf("new destination mixnet: %w", err)
+		return nil, fmt.Errorf("new destination mixnet: %w", err)
 	}
 	origin.RelayHandler().EnableLibp2pResourceManager(false)
 	origin.RelayHandler().SetMaxBandwidth(0)
@@ -1415,7 +1633,7 @@ func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCoun
 			for _, existing := range relayMixes {
 				existing.ForceCloseForTest()
 			}
-			return nil, nil, nil, fmt.Errorf("new relay mixnet: %w", relayErr)
+			return nil, fmt.Errorf("new relay mixnet: %w", relayErr)
 		}
 		relayMix.RelayHandler().EnableLibp2pResourceManager(false)
 		relayMix.RelayHandler().SetMaxBandwidth(0)
@@ -1431,7 +1649,7 @@ func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCoun
 		for _, relayMix := range relayMixes {
 			relayMix.ForceCloseForTest()
 		}
-		return nil, nil, nil, err
+		return nil, err
 	}
 	registerProtocols(allHosts, destHost.ID(), destHost.Addrs(), protocol.ID(mixnet.ProtocolID))
 	for _, h := range relayHosts {
@@ -1445,7 +1663,13 @@ func setupMixnetNetwork(ctx context.Context, cfg *mixnet.MixnetConfig, relayCoun
 			relayMix.ForceCloseForTest()
 		}
 	}
-	return origin, dest, cleanup, nil
+	return &benchmarkNetwork{
+		origin:    origin,
+		dest:      dest,
+		relays:    relayMixes,
+		cleanup:   cleanup,
+		relayHost: relayHosts,
+	}, nil
 }
 
 func newBenchHost() (host.Host, error) {
@@ -1522,6 +1746,15 @@ func summarizeRuns(records []*runRecord) ([]summaryRecord, error) {
 			Label:                   base.Label,
 			Measurement:             base.Measurement,
 			Mode:                    base.Mode,
+			StreamProfile:           base.StreamProfile,
+			StreamKind:              base.StreamKind,
+			StreamQuality:           base.StreamQuality,
+			StreamWrites:            base.StreamWrites,
+			StreamBitrateKbps:       base.StreamBitrateKbps,
+			StreamSegmentMS:         base.StreamSegmentMS,
+			StreamDurationSec:       base.StreamDurationSec,
+			StreamWriteSizeBytes:    base.StreamWriteSizeBytes,
+			EnableSessionRouting:    base.EnableSessionRouting,
 			SizeBytes:               base.SizeBytes,
 			SizeLabel:               base.SizeLabel,
 			HopCount:                base.HopCount,
@@ -1686,6 +1919,7 @@ func writeMetadata(opts suiteOptions, scenarios []scenario) error {
 		"profile":     opts.Profile,
 		"generated":   time.Now().UTC().Format(time.RFC3339),
 		"runs":        opts.Runs,
+		"visualProof": opts.VisualProof,
 		"sizes":       opts.Sizes,
 		"hops":        opts.Hops,
 		"circuits":    opts.Circuits,
@@ -1729,13 +1963,14 @@ func writeRawRecords(outputDir string, records []*runRecord) error {
 	defer csvFile.Close()
 	writer := csv.NewWriter(csvFile)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
 	for _, rec := range records {
 		row := []string{
-			rec.ScenarioID, rec.Category, rec.Label, rec.Measurement, rec.Mode,
+			rec.ScenarioID, rec.Category, rec.Label, rec.Measurement, rec.Mode, rec.StreamProfile, rec.StreamKind, rec.StreamQuality, strconv.FormatBool(rec.StreamWrites),
+			strconv.Itoa(rec.StreamBitrateKbps), strconv.Itoa(rec.StreamSegmentMS), strconv.Itoa(rec.StreamDurationSec), strconv.Itoa(rec.StreamWriteSizeBytes), strconv.FormatBool(rec.EnableSessionRouting),
 			strconv.Itoa(rec.SizeBytes), rec.SizeLabel, strconv.Itoa(rec.RunIndex), rec.TimestampUTC.Format(time.RFC3339),
 			strconv.Itoa(rec.HopCount), strconv.Itoa(rec.CircuitCount), strconv.FormatBool(rec.UseCESPipeline), strconv.FormatBool(rec.UseCSE), strconv.FormatBool(rec.UseCompressionOnly),
 			rec.Compression, strconv.Itoa(rec.ErasureThreshold), fmt.Sprintf("%.2f", rec.ErasureThresholdPercent),
@@ -1768,13 +2003,14 @@ func writeSummaryRecords(outputDir string, summaries []summaryRecord) error {
 	defer file.Close()
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
 	for _, s := range summaries {
 		row := []string{
-			s.ScenarioID, s.Category, s.Label, s.Measurement, s.Mode,
+			s.ScenarioID, s.Category, s.Label, s.Measurement, s.Mode, s.StreamProfile, s.StreamKind, s.StreamQuality, strconv.FormatBool(s.StreamWrites),
+			strconv.Itoa(s.StreamBitrateKbps), strconv.Itoa(s.StreamSegmentMS), strconv.Itoa(s.StreamDurationSec), strconv.Itoa(s.StreamWriteSizeBytes), strconv.FormatBool(s.EnableSessionRouting),
 			strconv.Itoa(s.SizeBytes), s.SizeLabel, strconv.Itoa(s.HopCount), strconv.Itoa(s.CircuitCount),
 			strconv.FormatBool(s.UseCESPipeline), strconv.FormatBool(s.UseCSE), strconv.FormatBool(s.UseCompressionOnly), s.Compression, strconv.Itoa(s.ErasureThreshold), fmt.Sprintf("%.2f", s.ErasureThresholdPercent),
 			s.SelectionMode, s.PayloadPaddingStrategy, strconv.FormatBool(s.HeaderPaddingEnabled), strconv.FormatBool(s.EnableAuthTag), strconv.Itoa(s.MaxJitterMS),
