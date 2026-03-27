@@ -30,7 +30,12 @@ type Compressor interface {
 type gzipCompressor struct {
 	level      int
 	writerPool sync.Pool
+	readerPool sync.Pool
 	bufferPool sync.Pool
+}
+
+type gzipReaderState struct {
+	reader *gzip.Reader
 }
 
 // NewCompressor returns a new Compressor for the specified algorithm ("gzip" or "snappy").
@@ -64,6 +69,9 @@ func newGzipCompressor(level int) *gzipCompressor {
 	c := &gzipCompressor{level: level}
 	c.bufferPool.New = func() any {
 		return new(bytes.Buffer)
+	}
+	c.readerPool.New = func() any {
+		return &gzipReaderState{}
 	}
 	c.writerPool.New = func() any {
 		gw, err := gzip.NewWriterLevel(io.Discard, level)
@@ -126,13 +134,22 @@ func (c *gzipCompressor) Decompress(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("unexpected algorithm ID: want %d, got %d", AlgoGzip, data[0])
 	}
 
-	gr, err := gzip.NewReader(bytes.NewReader(data[1:]))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer gr.Close()
+	state := c.readerPool.Get().(*gzipReaderState)
+	defer c.readerPool.Put(state)
 
-	return io.ReadAll(gr)
+	reader := bytes.NewReader(data[1:])
+	if state.reader == nil {
+		gr, err := gzip.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		state.reader = gr
+	} else if err := state.reader.Reset(reader); err != nil {
+		return nil, fmt.Errorf("failed to reset gzip reader: %w", err)
+	}
+	defer state.reader.Close()
+
+	return io.ReadAll(state.reader)
 }
 
 // snappyCompressor implements the Compressor interface using the Snappy algorithm.

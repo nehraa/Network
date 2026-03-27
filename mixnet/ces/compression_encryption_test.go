@@ -52,3 +52,35 @@ func TestLayeredEncrypterRoundTrip(t *testing.T) {
 		t.Fatal("layered encryption round trip mismatch")
 	}
 }
+
+func BenchmarkGzipCompressorDecompress(b *testing.B) {
+	compressor := NewCompressor("gzip")
+	payload := bytes.Repeat([]byte("mixnet-gzip-reader-pool-"), 256)
+
+	compressed, err := compressor.Compress(payload)
+	if err != nil {
+		b.Fatalf("Compress() error = %v", err)
+	}
+
+	verified, err := compressor.Decompress(compressed)
+	if err != nil {
+		b.Fatalf("Decompress() verification error = %v", err)
+	}
+	if !bytes.Equal(verified, payload) {
+		b.Fatal("verification round trip mismatch")
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		out, err := compressor.Decompress(compressed)
+		if err != nil {
+			b.Fatalf("Decompress() error = %v", err)
+		}
+		if len(out) != len(payload) {
+			b.Fatalf("len(out) = %d, want %d", len(out), len(payload))
+		}
+	}
+}
