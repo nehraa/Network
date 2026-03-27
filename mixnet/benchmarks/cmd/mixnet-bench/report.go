@@ -25,6 +25,7 @@ type relativeSeriesSpec struct {
 
 type reportData struct {
 	Profile     string
+	Network     string
 	Outlier     string
 	Adjustment  string
 	Graphs      []reportGraph
@@ -45,7 +46,12 @@ type comparisonTable struct {
 	Rows        [][]string
 }
 
-func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord, best []bestRecord) error {
+type measurementSamples struct {
+	TotalMS        []float64
+	ThroughputMBps []float64
+}
+
+func writeReport(outputDir string, opts suiteOptions, runRecords []*runRecord, summaries []summaryRecord, best []bestRecord) error {
 	graphDir := filepath.Join(outputDir, "graphs")
 	if err := os.MkdirAll(graphDir, 0o755); err != nil {
 		return err
@@ -55,6 +61,7 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	for _, summary := range summaries {
 		lookup[summary.ScenarioID] = append(lookup[summary.ScenarioID], summary)
 	}
+	sampleLookup := buildMeasurementSamples(runRecords)
 
 	graphs := make([]reportGraph, 0, 18)
 	addChart := func(title, file, yLabel string, chartData []chartSeries, value func(summaryRecord) float64) error {
@@ -97,14 +104,21 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
 	} else if opts.Profile == "quick" {
 		adjustmentNote = "Quick uses fixed 256KB application writes for the main routed stream sweep and also includes bitrate-shaped audio and video stream presets. The base comparison is direct libp2p against header-only mixnet with session routing enabled and full-onion mixnet on the legacy per-frame path at 2 hops and 1 circuit. Media presets use a fixed virtual stream duration and bitrate-derived write sizes; they are not real-time paced."
 	}
+	adjustments := make([]string, 0, 2)
+	if adjustmentNote != "" {
+		adjustments = append(adjustments, adjustmentNote)
+	}
+	adjustments = append(adjustments, fmt.Sprintf("Warmup uses %d unrecorded runs per scenario and size. Statistical comparisons use Welch's t-test on the kept measured runs at alpha %.3f.", opts.WarmupRuns, opts.SignificanceAlpha))
+
 	data := reportData{
 		Profile:     opts.Profile,
+		Network:     opts.NetworkCondition.Summary(),
 		Outlier:     fmt.Sprintf("For each scenario and size, %d raw runs are recorded and the benchmark applies this trim rule before computing averages and standard deviation: %s.", opts.Runs, describeOutlierRuleWithOverrides(opts.Runs, opts.SizeRunOverrides)),
-		Adjustment:  adjustmentNote,
+		Adjustment:  strings.Join(adjustments, " "),
 		Graphs:      graphs,
 		Best:        best,
 		Summaries:   compactSummaries(summaries),
-		Comparisons: buildComparisonTables(opts, lookup),
+		Comparisons: buildComparisonTables(opts, lookup, sampleLookup),
 	}
 
 	const reportTemplate = `<!doctype html>
@@ -128,6 +142,7 @@ func writeReport(outputDir string, opts suiteOptions, summaries []summaryRecord,
   <h1>Mixnet benchmark report</h1>
   <div class="card">
     <p><strong>Profile:</strong> {{.Profile}}</p>
+    <p><strong>Network:</strong> {{.Network}}</p>
     <p>{{.Outlier}}</p>
     {{if .Adjustment}}<p>{{.Adjustment}}</p>{{end}}
     <p>Raw files: <code>raw_runs.csv</code>, <code>raw_runs.jsonl</code>. Aggregates: <code>summary.csv</code>, <code>summary.json</code>, <code>best_hops_circuits.csv</code>.</p>
@@ -453,13 +468,56 @@ func compactSummaries(summaries []summaryRecord) []summaryRecord {
 	return out
 }
 
-func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord) []comparisonTable {
+func buildMeasurementSamples(records []*runRecord) map[string]measurementSamples {
+	lookup := make(map[string]measurementSamples)
+	for _, record := range records {
+		if record == nil || record.Error != "" || record.Excluded {
+			continue
+		}
+		key := measurementSampleKey(record.ScenarioID, record.SizeBytes)
+		samples := lookup[key]
+		samples.TotalMS = append(samples.TotalMS, record.TotalMS)
+		samples.ThroughputMBps = append(samples.ThroughputMBps, record.ThroughputMBps)
+		lookup[key] = samples
+	}
+	return lookup
+}
+
+func measurementSampleKey(scenarioID string, sizeBytes int) string {
+	return scenarioID + "|" + strconv.Itoa(sizeBytes)
+}
+
+func compareLatencySamples(sampleLookup map[string]measurementSamples, baselineID, candidateID string, sizeBytes int, alpha float64) WelchTTestResult {
+	baseline := sampleLookup[measurementSampleKey(baselineID, sizeBytes)]
+	candidate := sampleLookup[measurementSampleKey(candidateID, sizeBytes)]
+	return WelchTTest(candidate.TotalMS, baseline.TotalMS, alpha)
+}
+
+func compareThroughputSamples(sampleLookup map[string]measurementSamples, baselineID, candidateID string, sizeBytes int, alpha float64) WelchTTestResult {
+	baseline := sampleLookup[measurementSampleKey(baselineID, sizeBytes)]
+	candidate := sampleLookup[measurementSampleKey(candidateID, sizeBytes)]
+	return WelchTTest(candidate.ThroughputMBps, baseline.ThroughputMBps, alpha)
+}
+
+func formatSignificance(result WelchTTestResult) string {
+	if !result.Valid {
+		return "n/a"
+	}
+	if result.PValue < 0.001 {
+		return fmt.Sprintf("<0.001 (%s)", result.EffectSizeLabel)
+	}
+	return fmt.Sprintf("%.3f (%s)", result.PValue, result.EffectSizeLabel)
+}
+
+func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples) []comparisonTable {
 	if opts.Profile != "quick" {
 		return nil
 	}
 	tables := []comparisonTable{
 		buildLatencyComparisonTable(
 			lookup,
+			sampleLookup,
+			opts.SignificanceAlpha,
 			"Quick routed stream latency comparison: 2 hops, 1 circuit",
 			"Exact mean total latency and percent overhead for header-only routed versus direct and full-onion legacy.",
 			"focused-direct-baseline",
@@ -468,6 +526,8 @@ func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord)
 		),
 		buildThroughputComparisonTable(
 			lookup,
+			sampleLookup,
+			opts.SignificanceAlpha,
 			"Quick routed stream throughput comparison: 2 hops, 1 circuit",
 			"Exact mean throughput and percent delta for header-only routed versus direct and full-onion legacy.",
 			"focused-direct-baseline",
@@ -475,30 +535,35 @@ func buildComparisonTables(opts suiteOptions, lookup map[string][]summaryRecord)
 			"focused-full-c1-legacy",
 		),
 	}
-	tables = append(tables, buildQuickMediaTables(lookup)...)
+	tables = append(tables, buildQuickMediaTables(lookup, sampleLookup, opts.SignificanceAlpha)...)
 	return tables
 }
 
-func buildQuickMediaTables(lookup map[string][]summaryRecord) []comparisonTable {
+func buildQuickMediaTables(lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64) []comparisonTable {
 	return []comparisonTable{
-		buildMediaLatencyComparisonTable(lookup, "audio"),
-		buildMediaThroughputComparisonTable(lookup, "audio"),
-		buildMediaLatencyComparisonTable(lookup, "video"),
-		buildMediaThroughputComparisonTable(lookup, "video"),
+		buildMediaLatencyComparisonTable(lookup, sampleLookup, alpha, "audio"),
+		buildMediaThroughputComparisonTable(lookup, sampleLookup, alpha, "audio"),
+		buildMediaLatencyComparisonTable(lookup, sampleLookup, alpha, "video"),
+		buildMediaThroughputComparisonTable(lookup, sampleLookup, alpha, "video"),
 	}
 }
 
-func buildLatencyComparisonTable(lookup map[string][]summaryRecord, title, description, baselineID, headerID, fullID string) comparisonTable {
+func buildLatencyComparisonTable(lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, title, description, baselineID, headerID, fullID string) comparisonTable {
 	return buildLatencyComparisonTableFromMaps(
 		title,
 		description,
 		summaryMapBySize(sortedPointsByID(lookup, baselineID)),
 		summaryMapBySize(sortedPointsByID(lookup, headerID)),
 		summaryMapBySize(sortedPointsByID(lookup, fullID)),
+		sampleLookup,
+		alpha,
+		baselineID,
+		headerID,
+		fullID,
 	)
 }
 
-func buildLatencyComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord) comparisonTable {
+func buildLatencyComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, baselineID, headerID, fullID string) comparisonTable {
 	sizes := make([]int, 0, len(baseBySize))
 	for size := range baseBySize {
 		if _, ok := headerBySize[size]; !ok {
@@ -516,14 +581,20 @@ func buildLatencyComparisonTableFromMaps(title, description string, baseBySize, 
 		base := baseBySize[size]
 		header := headerBySize[size]
 		full := fullBySize[size]
+		headerStats := compareLatencySamples(sampleLookup, baselineID, headerID, size, alpha)
+		fullStats := compareLatencySamples(sampleLookup, baselineID, fullID, size, alpha)
+		fullVsHeaderStats := compareLatencySamples(sampleLookup, headerID, fullID, size, alpha)
 		rows = append(rows, []string{
 			base.SizeLabel,
 			fmt.Sprintf("%.3f", base.TotalMeanMS),
 			fmt.Sprintf("%.3f", header.TotalMeanMS),
 			fmt.Sprintf("%.2f%%", percentDelta(header.TotalMeanMS, base.TotalMeanMS)),
+			formatSignificance(headerStats),
 			fmt.Sprintf("%.3f", full.TotalMeanMS),
 			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, base.TotalMeanMS)),
+			formatSignificance(fullStats),
 			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, header.TotalMeanMS)),
+			formatSignificance(fullVsHeaderStats),
 		})
 	}
 
@@ -535,25 +606,33 @@ func buildLatencyComparisonTableFromMaps(title, description string, baseBySize, 
 			"Direct ms",
 			"Header-only ms",
 			"Header-only overhead vs direct %",
+			"Header-only p vs direct",
 			"Full onion ms",
 			"Full onion overhead vs direct %",
+			"Full onion p vs direct",
 			"Full vs header-only %",
+			"Full vs header-only p",
 		},
 		Rows: rows,
 	}
 }
 
-func buildThroughputComparisonTable(lookup map[string][]summaryRecord, title, description, baselineID, headerID, fullID string) comparisonTable {
+func buildThroughputComparisonTable(lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, title, description, baselineID, headerID, fullID string) comparisonTable {
 	return buildThroughputComparisonTableFromMaps(
 		title,
 		description,
 		summaryMapBySize(sortedPointsByID(lookup, baselineID)),
 		summaryMapBySize(sortedPointsByID(lookup, headerID)),
 		summaryMapBySize(sortedPointsByID(lookup, fullID)),
+		sampleLookup,
+		alpha,
+		baselineID,
+		headerID,
+		fullID,
 	)
 }
 
-func buildThroughputComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord) comparisonTable {
+func buildThroughputComparisonTableFromMaps(title, description string, baseBySize, headerBySize, fullBySize map[int]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, baselineID, headerID, fullID string) comparisonTable {
 	sizes := make([]int, 0, len(baseBySize))
 	for size := range baseBySize {
 		if _, ok := headerBySize[size]; !ok {
@@ -571,14 +650,20 @@ func buildThroughputComparisonTableFromMaps(title, description string, baseBySiz
 		base := baseBySize[size]
 		header := headerBySize[size]
 		full := fullBySize[size]
+		headerStats := compareThroughputSamples(sampleLookup, baselineID, headerID, size, alpha)
+		fullStats := compareThroughputSamples(sampleLookup, baselineID, fullID, size, alpha)
+		fullVsHeaderStats := compareThroughputSamples(sampleLookup, headerID, fullID, size, alpha)
 		rows = append(rows, []string{
 			base.SizeLabel,
 			fmt.Sprintf("%.3f", base.ThroughputMeanMBps),
 			fmt.Sprintf("%.3f", header.ThroughputMeanMBps),
 			fmt.Sprintf("%.2f%%", percentDelta(header.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			formatSignificance(headerStats),
 			fmt.Sprintf("%.3f", full.ThroughputMeanMBps),
 			fmt.Sprintf("%.2f%%", percentDelta(full.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			formatSignificance(fullStats),
 			fmt.Sprintf("%.2f%%", percentDelta(full.ThroughputMeanMBps, header.ThroughputMeanMBps)),
+			formatSignificance(fullVsHeaderStats),
 		})
 	}
 
@@ -590,15 +675,18 @@ func buildThroughputComparisonTableFromMaps(title, description string, baseBySiz
 			"Direct MiB/s",
 			"Header-only MiB/s",
 			"Header-only vs direct %",
+			"Header-only p vs direct",
 			"Full onion MiB/s",
 			"Full onion vs direct %",
+			"Full onion p vs direct",
 			"Full vs header-only %",
+			"Full vs header-only p",
 		},
 		Rows: rows,
 	}
 }
 
-func buildMediaLatencyComparisonTable(lookup map[string][]summaryRecord, kind string) comparisonTable {
+func buildMediaLatencyComparisonTable(lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, kind string) comparisonTable {
 	rows := make([][]string, 0)
 	for _, profile := range quickMediaProfiles {
 		if profile.Kind != kind {
@@ -616,6 +704,9 @@ func buildMediaLatencyComparisonTable(lookup map[string][]summaryRecord, kind st
 		if !ok {
 			continue
 		}
+		headerStats := compareLatencySamples(sampleLookup, quickMediaScenarioID(profile, "direct"), quickMediaScenarioID(profile, "header-routed"), base.SizeBytes, alpha)
+		fullStats := compareLatencySamples(sampleLookup, quickMediaScenarioID(profile, "direct"), quickMediaScenarioID(profile, "full-legacy"), base.SizeBytes, alpha)
+		fullVsHeaderStats := compareLatencySamples(sampleLookup, quickMediaScenarioID(profile, "header-routed"), quickMediaScenarioID(profile, "full-legacy"), base.SizeBytes, alpha)
 		rows = append(rows, []string{
 			profile.Quality,
 			strconv.Itoa(profile.BitrateKbps),
@@ -625,9 +716,12 @@ func buildMediaLatencyComparisonTable(lookup map[string][]summaryRecord, kind st
 			fmt.Sprintf("%.3f", base.TotalMeanMS),
 			fmt.Sprintf("%.3f", header.TotalMeanMS),
 			fmt.Sprintf("%.2f%%", percentDelta(header.TotalMeanMS, base.TotalMeanMS)),
+			formatSignificance(headerStats),
 			fmt.Sprintf("%.3f", full.TotalMeanMS),
 			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, base.TotalMeanMS)),
+			formatSignificance(fullStats),
 			fmt.Sprintf("%.2f%%", percentDelta(full.TotalMeanMS, header.TotalMeanMS)),
+			formatSignificance(fullVsHeaderStats),
 		})
 	}
 	titleKind := displayKind(kind)
@@ -643,15 +737,18 @@ func buildMediaLatencyComparisonTable(lookup map[string][]summaryRecord, kind st
 			"Direct ms",
 			"Header-only ms",
 			"Header-only overhead vs direct %",
+			"Header-only p vs direct",
 			"Full onion ms",
 			"Full onion overhead vs direct %",
+			"Full onion p vs direct",
 			"Full vs header-only %",
+			"Full vs header-only p",
 		},
 		Rows: rows,
 	}
 }
 
-func buildMediaThroughputComparisonTable(lookup map[string][]summaryRecord, kind string) comparisonTable {
+func buildMediaThroughputComparisonTable(lookup map[string][]summaryRecord, sampleLookup map[string]measurementSamples, alpha float64, kind string) comparisonTable {
 	rows := make([][]string, 0)
 	for _, profile := range quickMediaProfiles {
 		if profile.Kind != kind {
@@ -669,6 +766,9 @@ func buildMediaThroughputComparisonTable(lookup map[string][]summaryRecord, kind
 		if !ok {
 			continue
 		}
+		headerStats := compareThroughputSamples(sampleLookup, quickMediaScenarioID(profile, "direct"), quickMediaScenarioID(profile, "header-routed"), base.SizeBytes, alpha)
+		fullStats := compareThroughputSamples(sampleLookup, quickMediaScenarioID(profile, "direct"), quickMediaScenarioID(profile, "full-legacy"), base.SizeBytes, alpha)
+		fullVsHeaderStats := compareThroughputSamples(sampleLookup, quickMediaScenarioID(profile, "header-routed"), quickMediaScenarioID(profile, "full-legacy"), base.SizeBytes, alpha)
 		rows = append(rows, []string{
 			profile.Quality,
 			strconv.Itoa(profile.BitrateKbps),
@@ -678,9 +778,12 @@ func buildMediaThroughputComparisonTable(lookup map[string][]summaryRecord, kind
 			fmt.Sprintf("%.3f", base.ThroughputMeanMBps),
 			fmt.Sprintf("%.3f", header.ThroughputMeanMBps),
 			fmt.Sprintf("%.2f%%", percentDelta(header.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			formatSignificance(headerStats),
 			fmt.Sprintf("%.3f", full.ThroughputMeanMBps),
 			fmt.Sprintf("%.2f%%", percentDelta(full.ThroughputMeanMBps, base.ThroughputMeanMBps)),
+			formatSignificance(fullStats),
 			fmt.Sprintf("%.2f%%", percentDelta(full.ThroughputMeanMBps, header.ThroughputMeanMBps)),
+			formatSignificance(fullVsHeaderStats),
 		})
 	}
 	titleKind := displayKind(kind)
@@ -696,9 +799,12 @@ func buildMediaThroughputComparisonTable(lookup map[string][]summaryRecord, kind
 			"Direct MiB/s",
 			"Header-only MiB/s",
 			"Header-only vs direct %",
+			"Header-only p vs direct",
 			"Full onion MiB/s",
 			"Full onion vs direct %",
+			"Full onion p vs direct",
 			"Full vs header-only %",
+			"Full vs header-only p",
 		},
 		Rows: rows,
 	}

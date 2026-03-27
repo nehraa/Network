@@ -30,15 +30,22 @@ func parseOptions() (suiteOptions, error) {
 	defaultOutput := filepath.Join("mixnet", "benchmarks", "output", time.Now().Format("20060102-150405"))
 
 	var (
-		profile     = flag.String("profile", "full", "benchmark profile: smoke, quick, or full")
-		outputDir   = flag.String("output-dir", defaultOutput, "directory for raw data, summaries, and graphs")
-		sizes       = flag.String("sizes", "", "comma-separated sizes like 1KB,64KB,1MB,50MB (overrides profile)")
-		hops        = flag.String("hops", "", "comma-separated hop counts (overrides profile)")
-		circuits    = flag.String("circuits", "", "comma-separated circuit counts (overrides profile)")
-		runs        = flag.Int("runs", 0, "runs per scenario and size (overrides profile)")
-		groups      = flag.String("groups", "", "comma-separated benchmark groups (overrides profile)")
-		timeout     = flag.Duration("timeout", 0, "per-run timeout (default depends on selected sizes)")
-		visualProof = flag.Bool("visual-proof", false, "write a separate post-run 64KB visual proof file for quick profile")
+		profile              = flag.String("profile", "full", "benchmark profile: smoke, quick, or full")
+		outputDir            = flag.String("output-dir", defaultOutput, "directory for raw data, summaries, and graphs")
+		sizes                = flag.String("sizes", "", "comma-separated sizes like 1KB,64KB,1MB,50MB (overrides profile)")
+		hops                 = flag.String("hops", "", "comma-separated hop counts (overrides profile)")
+		circuits             = flag.String("circuits", "", "comma-separated circuit counts (overrides profile)")
+		runs                 = flag.Int("runs", 0, "runs per scenario and size (overrides profile)")
+		groups               = flag.String("groups", "", "comma-separated benchmark groups (overrides profile)")
+		timeout              = flag.Duration("timeout", 0, "per-run timeout (default depends on selected sizes)")
+		visualProof          = flag.Bool("visual-proof", false, "write a separate post-run 64KB visual proof file for quick profile")
+		warmup               = flag.Int("warmup", 3, "number of warmup runs before measured runs (0 to disable)")
+		alpha                = flag.Float64("alpha", 0.05, "significance level for statistical tests (default 0.05)")
+		networkProfile       = flag.String("network-profile", "localhost", "network simulation profile: localhost, 3g, satellite, high-latency, or custom")
+		networkLatencyMS     = flag.Int("network-latency-ms", -1, "override base network latency in milliseconds")
+		networkJitterMS      = flag.Int("network-jitter-ms", -1, "override network jitter in milliseconds")
+		networkPacketLossPct = flag.Float64("network-packet-loss-pct", -1, "override packet loss percentage (0-100)")
+		networkBandwidthMbps = flag.Int("network-bandwidth-mbps", -1, "override bandwidth limit in Mbps (0 disables throttling)")
 	)
 	flag.Parse()
 
@@ -49,6 +56,13 @@ func parseOptions() (suiteOptions, error) {
 	opts.OutputDir = *outputDir
 	opts.Timeout = *timeout
 	opts.VisualProof = *visualProof
+	opts.WarmupRuns = *warmup
+	opts.SignificanceAlpha = *alpha
+	opts.NetworkProfile = *networkProfile
+	opts.NetworkLatencyOverrideMS = *networkLatencyMS
+	opts.NetworkJitterOverrideMS = *networkJitterMS
+	opts.NetworkPacketLossOverridePct = *networkPacketLossPct
+	opts.NetworkBandwidthOverrideMbps = *networkBandwidthMbps
 
 	if strings.TrimSpace(*sizes) != "" {
 		opts.SizeSpec = *sizes
