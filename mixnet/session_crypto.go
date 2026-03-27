@@ -25,6 +25,7 @@ const (
 	sessionCryptoModePerShard       byte = 0x01
 	sessionCryptoModeWholeStream    byte = 0x02
 	sessionCryptoModePerShardStream byte = 0x03
+	sessionStreamNonceDomain             = "mixnet-stream-session-nonce"
 )
 
 type sessionKey struct {
@@ -50,7 +51,8 @@ func encryptSessionPayloadWithKey(plaintext []byte, session sessionKey, sessionI
 	if err != nil {
 		return nil, err
 	}
-	ciphertext := aead.Seal(nil, sessionPayloadNonce(session, sessionID), plaintext, nil)
+	var nonceBuf [sessionNonceSize]byte
+	ciphertext := aead.Seal(nil, sessionPayloadNonceBytes(&nonceBuf, session, sessionID), plaintext, nil)
 	return ciphertext, nil
 }
 
@@ -62,7 +64,8 @@ func decryptSessionPayloadWithKey(ciphertext []byte, key sessionKey, sessionID s
 	if err != nil {
 		return nil, err
 	}
-	return aead.Open(nil, sessionPayloadNonce(key, sessionID), ciphertext, nil)
+	var nonceBuf [sessionNonceSize]byte
+	return aead.Open(nil, sessionPayloadNonceBytes(&nonceBuf, key, sessionID), ciphertext, nil)
 }
 
 func encryptSessionShardsWithKey(plaintext []byte, session sessionKey, total int, sessionID string) ([]*ces.Shard, error) {
@@ -74,14 +77,15 @@ func encryptSessionShardsWithKey(plaintext []byte, session sessionKey, total int
 		return nil, err
 	}
 
-	workerCount := shardCryptoWorkerCount(total)
+	workerCount := shardCryptoWorkerCount(total, len(plaintext))
 	if workerCount == 1 {
 		aead, err := chacha20poly1305.NewX(session.Key)
 		if err != nil {
 			return nil, err
 		}
+		var nonceBuf [sessionNonceSize]byte
 		for _, shard := range shards {
-			nonce := sessionShardNonce(session, sessionID, shard.Index)
+			nonce := sessionShardNonceBytes(&nonceBuf, session, sessionID, shard.Index)
 			shard.Data = aead.Seal(nil, nonce, shard.Data, nil)
 		}
 		return shards, nil
@@ -106,9 +110,10 @@ func encryptSessionShardsWithKey(plaintext []byte, session sessionKey, total int
 				})
 				return
 			}
+			var nonceBuf [sessionNonceSize]byte
 
 			for shard := range jobs {
-				nonce := sessionShardNonce(session, sessionID, shard.Index)
+				nonce := sessionShardNonceBytes(&nonceBuf, session, sessionID, shard.Index)
 				shard.Data = aead.Seal(nil, nonce, shard.Data, nil)
 			}
 		}()
@@ -126,13 +131,18 @@ func encryptSessionShardsWithKey(plaintext []byte, session sessionKey, total int
 	return shards, nil
 }
 
-func shardCryptoWorkerCount(total int) int {
+func shardCryptoWorkerCount(total int, payloadLen int) int {
 	if total <= 1 {
 		return 1
 	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 1 {
 		workers = 1
+	}
+	// Small payloads or shallow shard counts lose more to goroutine/channel
+	// setup than they gain from parallel AEAD work.
+	if payloadLen < 32*1024 || total < workers*2 {
+		return 1
 	}
 	if workers > total {
 		return total
@@ -148,25 +158,29 @@ func decryptSessionShardPayloadWithKey(ciphertext []byte, key sessionKey, shardI
 	if err != nil {
 		return nil, err
 	}
-	return aead.Open(nil, sessionShardNonce(key, sessionID, shardIndex), ciphertext, nil)
+	var nonceBuf [sessionNonceSize]byte
+	return aead.Open(nil, sessionShardNonceBytes(&nonceBuf, key, sessionID, shardIndex), ciphertext, nil)
 }
 
 func streamSessionMode(mode byte) bool {
 	return mode == sessionCryptoModeWholeStream || mode == sessionCryptoModePerShardStream
 }
 
-func sessionPayloadNonce(key sessionKey, sessionID string) []byte {
+func sessionPayloadNonceBytes(dst *[sessionNonceSize]byte, key sessionKey, sessionID string) []byte {
 	if !streamSessionMode(key.Mode) {
 		return key.Nonce
 	}
-	return deriveSessionStreamNonce(key.Nonce, streamSessionSequence(sessionID), -1)
+	fillSessionStreamNonce(dst, key.Nonce, streamSessionSequence(sessionID), -1)
+	return dst[:]
 }
 
-func sessionShardNonce(key sessionKey, sessionID string, shardIndex int) []byte {
+func sessionShardNonceBytes(dst *[sessionNonceSize]byte, key sessionKey, sessionID string, shardIndex int) []byte {
 	if !streamSessionMode(key.Mode) {
-		return deriveSessionShardNonce(key.Nonce, shardIndex)
+		fillSessionShardNonce(dst, key.Nonce, shardIndex)
+		return dst[:]
 	}
-	return deriveSessionStreamNonce(key.Nonce, streamSessionSequence(sessionID), shardIndex)
+	fillSessionStreamNonce(dst, key.Nonce, streamSessionSequence(sessionID), shardIndex)
+	return dst[:]
 }
 
 func streamSessionSequence(sessionID string) uint64 {
@@ -177,20 +191,18 @@ func streamSessionSequence(sessionID string) uint64 {
 	return seq
 }
 
-func deriveSessionStreamNonce(base []byte, seq uint64, shardIndex int) []byte {
-	h := sha256.New()
-	_, _ = h.Write([]byte("mixnet-stream-session-nonce"))
-	_, _ = h.Write(base)
+func fillSessionStreamNonce(dst *[sessionNonceSize]byte, base []byte, seq uint64, shardIndex int) {
 	var buf [12]byte
 	binary.LittleEndian.PutUint64(buf[:8], seq)
 	if shardIndex >= 0 {
 		binary.LittleEndian.PutUint32(buf[8:], uint32(shardIndex+1))
 	}
-	_, _ = h.Write(buf[:])
-	sum := h.Sum(nil)
-	nonce := make([]byte, sessionNonceSize)
-	copy(nonce, sum[:sessionNonceSize])
-	return nonce
+	var input [len(sessionStreamNonceDomain) + sessionNonceSize + 12]byte
+	pos := copy(input[:], sessionStreamNonceDomain)
+	pos += copy(input[pos:], base)
+	copy(input[pos:], buf[:])
+	sum := sha256.Sum256(input[:])
+	copy(dst[:], sum[:sessionNonceSize])
 }
 
 func encryptSessionShards(plaintext []byte, total int) ([]*ces.Shard, []byte, error) {
@@ -228,11 +240,10 @@ func newSessionKey(mode byte) (sessionKey, error) {
 	return sessionKey{Key: key, Nonce: nonce, Mode: mode}, nil
 }
 
-func deriveSessionShardNonce(base []byte, shardIndex int) []byte {
-	nonce := append([]byte(nil), base...)
-	tail := binary.LittleEndian.Uint64(nonce[len(nonce)-8:])
-	binary.LittleEndian.PutUint64(nonce[len(nonce)-8:], tail^uint64(shardIndex+1))
-	return nonce
+func fillSessionShardNonce(dst *[sessionNonceSize]byte, base []byte, shardIndex int) {
+	copy(dst[:], base)
+	tail := binary.LittleEndian.Uint64(dst[sessionNonceSize-8:])
+	binary.LittleEndian.PutUint64(dst[sessionNonceSize-8:], tail^uint64(shardIndex+1))
 }
 
 func encodeSessionKeyData(key sessionKey) []byte {

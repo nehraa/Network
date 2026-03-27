@@ -59,3 +59,40 @@ func BenchmarkSessionDataFramePayload(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkEncryptSessionShardsWithKey(b *testing.B) {
+	payload := bytes.Repeat([]byte("mixnet-session-payload-"), 128)
+	session, err := newSessionKey(sessionCryptoModePerShardStream)
+	if err != nil {
+		b.Fatalf("newSessionKey() error = %v", err)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		if _, err := encryptSessionShardsWithKey(payload, session, 8, "stream-bench"); err != nil {
+			b.Fatalf("encryptSessionShardsWithKey() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkDecryptSessionShardPayloadWithKey(b *testing.B) {
+	payload := bytes.Repeat([]byte("mixnet-session-payload-"), 128)
+	session, err := newSessionKey(sessionCryptoModePerShardStream)
+	if err != nil {
+		b.Fatalf("newSessionKey() error = %v", err)
+	}
+	shards, err := encryptSessionShardsWithKey(payload, session, 8, "stream-bench")
+	if err != nil {
+		b.Fatalf("encryptSessionShardsWithKey() error = %v", err)
+	}
+	target := shards[3]
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(target.Data)))
+	for i := 0; i < b.N; i++ {
+		if _, err := decryptSessionShardPayloadWithKey(target.Data, session, target.Index, "stream-bench"); err != nil {
+			b.Fatalf("decryptSessionShardPayloadWithKey() error = %v", err)
+		}
+	}
+}
