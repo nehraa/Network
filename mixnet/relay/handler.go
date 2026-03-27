@@ -1395,15 +1395,19 @@ func readEncryptedFrameHeader(r *bufio.Reader) (string, byte, int, error) {
 }
 
 func readEncryptedFramePayload(r *bufio.Reader, scope network.StreamScope, payloadLen int) ([]byte, func(), error) {
+	payload, releaseScratch := borrowRelayScratch(payloadLen)
+
+	// Reserve memory based on actual buffer capacity to correctly account for pooled buffers
 	releaseMemory := func() {}
 	if scope != nil {
-		if err := scope.ReserveMemory(payloadLen, network.ReservationPriorityMedium); err != nil {
+		actualCapacity := cap(payload)
+		if err := scope.ReserveMemory(actualCapacity, network.ReservationPriorityMedium); err != nil {
+			releaseScratch()
 			return nil, nil, fmt.Errorf("rcmgr inbound memory reservation failed: %w", err)
 		}
-		releaseMemory = func() { scope.ReleaseMemory(payloadLen) }
+		releaseMemory = func() { scope.ReleaseMemory(actualCapacity) }
 	}
 
-	payload, releaseScratch := borrowRelayScratch(payloadLen)
 	release := func() {
 		releaseScratch()
 		releaseMemory()

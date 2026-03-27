@@ -64,6 +64,7 @@ require (
 	golang.org/x/sys v0.41.0
 	golang.org/x/time v0.12.0
 	golang.org/x/tools v0.41.0
+	gonum.org/v1/gonum v0.15.1
 	google.golang.org/protobuf v1.36.6
 )
 
@@ -104,7 +105,6 @@ require (
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260109210033-bd525da824e2 // indirect
 	golang.org/x/text v0.34.0 // indirect
-	gonum.org/v1/gonum v0.15.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
