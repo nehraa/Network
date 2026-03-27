@@ -1,8 +1,10 @@
 package relay
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"testing"
 
@@ -37,4 +39,52 @@ func encryptHopPayloadForBenchmark(key []byte, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	return aead.Seal(nonce, nonce, payload, nil), nil
+}
+
+func BenchmarkWriteHeaderOnlyFinalPayload(b *testing.B) {
+	control := bytes.Repeat([]byte{0x33}, 32)
+	payload := bytes.Repeat([]byte("mixnet-relay-final-payload-"), 128)
+	var sink bytes.Buffer
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(control) + len(payload) + 1))
+	for i := 0; i < b.N; i++ {
+		sink.Reset()
+		if _, err := writeHeaderOnlyFinalPayload(b.Context(), &sink, control, payload, nil, nil); err != nil {
+			b.Fatalf("writeHeaderOnlyFinalPayload() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkReadSessionDataControlPrefix(b *testing.B) {
+	baseID := "bench-session"
+	auth := bytes.Repeat([]byte{0x44}, 16)
+	data := bytes.Repeat([]byte("mixnet-relay-stream-data-"), 128)
+
+	var encoded bytes.Buffer
+	encoded.WriteByte(byte(len(baseID)))
+	encoded.WriteString(baseID)
+	encoded.WriteByte(sessionDataFlagSequenced)
+	var seqBuf [8]byte
+	binary.LittleEndian.PutUint64(seqBuf[:], 42)
+	encoded.Write(seqBuf[:])
+	var metaBuf [10]byte
+	binary.LittleEndian.PutUint16(metaBuf[8:], uint16(len(auth)))
+	encoded.Write(metaBuf[:])
+	encoded.Write(auth)
+	encoded.Write(data)
+	frame := encoded.Bytes()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(frame)))
+	for i := 0; i < b.N; i++ {
+		reader := bufio.NewReader(bytes.NewReader(frame))
+		baseID, prefix, dataLen, err := readSessionDataControlPrefix(reader, len(frame), nil)
+		if err != nil {
+			b.Fatalf("readSessionDataControlPrefix() error = %v", err)
+		}
+		if baseID == "" || len(prefix) == 0 || dataLen != len(data) {
+			b.Fatal("unexpected parsed control prefix result")
+		}
+	}
 }
