@@ -73,11 +73,16 @@ func TestMultipleTagsNoDecay(t *testing.T) {
 	_ = tag2.Bump(id, 100)
 	_ = tag3.Bump(id, 100)
 
-	waitForTag(t, mgr, id)
-
 	// all tags are upper-bounded, so the score must be 300
+	eventuallyEqual(t, func() int {
+		ti := mgr.GetTagInfo(id)
+		if ti == nil {
+			return 0
+		}
+		return ti.Value
+	}, 300)
+
 	ti := mgr.GetTagInfo(id)
-	require.Equal(t, 300, ti.Value)
 
 	for _, s := range []string{"beep", "bop", "foo"} {
 		if v, ok := ti.Tags[s]; !ok || v != 100 {
