@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -72,24 +73,8 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 	}
 
 	keys := make([]*EncryptionKey, e.hopCount)
-
-	// Generate ephemeral keys for each layer using Noise-derived key derivation
-	for i := 0; i < e.hopCount; i++ {
-		// Derive a per-hop key with random salt to prevent key predictability.
-		prologue := fmt.Sprintf("lib-mix-hop-%d-%s", i, destinations[i])
-		key, err := deriveKeyFromNoise([]byte(prologue), i)
-		if err != nil {
-			// Fallback to random key if derivation fails
-			key = make([]byte, 32)
-			if _, err := io.ReadFull(rand.Reader, key); err != nil {
-				return nil, nil, err
-			}
-		}
-		keys[i] = &EncryptionKey{
-			Key:         key,
-			Nonce:       0,
-			Destination: destinations[i],
-		}
+	if err := e.generateLayerKeys(destinations, keys); err != nil {
+		return nil, nil, err
 	}
 
 	// Build encrypted payload from outside in (reverse order for onion)
@@ -109,7 +94,9 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 		offset += len(keys[i].Destination)
 
 		// Prepend header to data
-		payload := append(header[:offset], currentData...)
+		payload := make([]byte, offset+len(currentData))
+		copy(payload, header[:offset])
+		copy(payload[offset:], currentData)
 
 		// Encrypt with ChaCha20-Poly1305 - SAME CIPHER as libp2p Noise uses
 		aead, err := chacha20poly1305.NewX(keys[i].Key)
@@ -123,16 +110,105 @@ func (e *LayeredEncrypter) Encrypt(plaintext []byte, destinations []string) ([]b
 			return nil, nil, err
 		}
 
-		// Seal appends ciphertext to dst (which is nonce in this case)
-		encrypted := aead.Seal(nil, nonce, payload, nil)
-		// Prepend nonce to ciphertext for decryption
-		currentData = append(nonce, encrypted...)
+		// Reuse the output prefix for the nonce to avoid an extra copy when
+		// carrying ciphertext to the next onion layer.
+		out := make([]byte, 0, len(nonce)+len(payload)+aead.Overhead())
+		out = append(out, nonce...)
+		currentData = aead.Seal(out, nonce, payload, nil)
 
 		// Increment nonce for next use
 		keys[i].Nonce++
 	}
 
 	return currentData, keys, nil
+}
+
+func (e *LayeredEncrypter) generateLayerKeys(destinations []string, keys []*EncryptionKey) error {
+	workerCount := cryptoWorkerCount(e.hopCount)
+	if workerCount == 1 {
+		for i := 0; i < e.hopCount; i++ {
+			key, err := deriveLayerKey(i, destinations[i])
+			if err != nil {
+				return err
+			}
+			keys[i] = &EncryptionKey{
+				Key:         key,
+				Nonce:       0,
+				Destination: destinations[i],
+			}
+		}
+		return nil
+	}
+
+	jobs := make(chan int, e.hopCount)
+	var (
+		wg       sync.WaitGroup
+		firstErr error
+		errMu    sync.Mutex
+	)
+
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				key, err := deriveLayerKey(idx, destinations[idx])
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					continue
+				}
+				keys[idx] = &EncryptionKey{
+					Key:         key,
+					Nonce:       0,
+					Destination: destinations[idx],
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < e.hopCount; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
+func deriveLayerKey(hopIndex int, destination string) ([]byte, error) {
+	prologue := fmt.Sprintf("lib-mix-hop-%d-%s", hopIndex, destination)
+	key, err := deriveKeyFromNoise([]byte(prologue), hopIndex)
+	if err == nil {
+		return key, nil
+	}
+
+	// Fall back to raw randomness if derivation fails so encryption remains available.
+	key = make([]byte, 32)
+	if _, readErr := io.ReadFull(rand.Reader, key); readErr != nil {
+		return nil, readErr
+	}
+	return key, nil
+}
+
+func cryptoWorkerCount(units int) int {
+	if units <= 1 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > units {
+		return units
+	}
+	return workers
 }
 
 // Decrypt removes one or more layers of onion encryption using the provided keys.

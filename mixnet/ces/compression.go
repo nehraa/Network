@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/golang/snappy"
 )
@@ -27,14 +28,16 @@ type Compressor interface {
 
 // gzipCompressor implements the Compressor interface using the Gzip algorithm.
 type gzipCompressor struct {
-	level int
+	level      int
+	writerPool sync.Pool
+	bufferPool sync.Pool
 }
 
 // NewCompressor returns a new Compressor for the specified algorithm ("gzip" or "snappy").
 func NewCompressor(algo string) Compressor {
 	switch algo {
 	case "gzip":
-		return &gzipCompressor{level: gzip.DefaultCompression}
+		return newGzipCompressor(gzip.DefaultCompression)
 	case "snappy":
 		return &snappyCompressor{}
 	default:
@@ -49,12 +52,27 @@ func NewCompressorWithLevel(algo string, level int) Compressor {
 		if level < gzip.HuffmanOnly || level > gzip.BestCompression {
 			level = gzip.DefaultCompression
 		}
-		return &gzipCompressor{level: level}
+		return newGzipCompressor(level)
 	case "snappy":
 		return &snappyCompressor{}
 	default:
 		return invalidCompressor{algo: algo}
 	}
+}
+
+func newGzipCompressor(level int) *gzipCompressor {
+	c := &gzipCompressor{level: level}
+	c.bufferPool.New = func() any {
+		return new(bytes.Buffer)
+	}
+	c.writerPool.New = func() any {
+		gw, err := gzip.NewWriterLevel(io.Discard, level)
+		if err != nil {
+			panic(err)
+		}
+		return gw
+	}
+	return c
 }
 
 type invalidCompressor struct {
@@ -75,15 +93,16 @@ func (c *gzipCompressor) Compress(data []byte) ([]byte, error) {
 		return []byte{}, nil
 	}
 
-	var buf bytes.Buffer
+	buf := c.bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer c.bufferPool.Put(buf)
 	buf.WriteByte(AlgoGzip)
 
-	gw, err := gzip.NewWriterLevel(&buf, c.level)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gzip writer: %w", err)
-	}
+	gw := c.writerPool.Get().(*gzip.Writer)
+	gw.Reset(buf)
+	defer c.writerPool.Put(gw)
 
-	_, err = gw.Write(data)
+	_, err := gw.Write(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compress: %w", err)
 	}
@@ -92,7 +111,9 @@ func (c *gzipCompressor) Compress(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
 	}
 
-	return buf.Bytes(), nil
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
 }
 
 // Decompress validates the header and decompresses data using Gzip.

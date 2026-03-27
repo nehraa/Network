@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
+	"sync"
 
 	"github.com/libp2p/go-libp2p/mixnet/ces"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -67,19 +69,75 @@ func encryptSessionShardsWithKey(plaintext []byte, session sessionKey, total int
 	if total <= 0 {
 		return nil, fmt.Errorf("invalid shard count: %d", total)
 	}
-	aead, err := chacha20poly1305.NewX(session.Key)
-	if err != nil {
-		return nil, err
-	}
 	shards, err := shardEvenly(plaintext, total)
 	if err != nil {
 		return nil, err
 	}
-	for _, shard := range shards {
-		nonce := sessionShardNonce(session, sessionID, shard.Index)
-		shard.Data = aead.Seal(nil, nonce, shard.Data, nil)
+
+	workerCount := shardCryptoWorkerCount(total)
+	if workerCount == 1 {
+		aead, err := chacha20poly1305.NewX(session.Key)
+		if err != nil {
+			return nil, err
+		}
+		for _, shard := range shards {
+			nonce := sessionShardNonce(session, sessionID, shard.Index)
+			shard.Data = aead.Seal(nil, nonce, shard.Data, nil)
+		}
+		return shards, nil
 	}
+
+	jobs := make(chan *ces.Shard, len(shards))
+	var (
+		wg       sync.WaitGroup
+		firstErr error
+		errOnce  sync.Once
+	)
+
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			aead, err := chacha20poly1305.NewX(session.Key)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+				})
+				return
+			}
+
+			for shard := range jobs {
+				nonce := sessionShardNonce(session, sessionID, shard.Index)
+				shard.Data = aead.Seal(nil, nonce, shard.Data, nil)
+			}
+		}()
+	}
+
+	for _, shard := range shards {
+		jobs <- shard
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
 	return shards, nil
+}
+
+func shardCryptoWorkerCount(total int) int {
+	if total <= 1 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > total {
+		return total
+	}
+	return workers
 }
 
 func decryptSessionShardPayloadWithKey(ciphertext []byte, key sessionKey, shardIndex int, sessionID string) ([]byte, error) {
