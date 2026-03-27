@@ -18,15 +18,32 @@ func BenchmarkDecryptHopPayload(b *testing.B) {
 	if err != nil {
 		b.Fatalf("encryptHopPayloadForBenchmark() setup error = %v", err)
 	}
-
-	b.ReportAllocs()
-	b.SetBytes(int64(len(plaintext)))
-	for i := 0; i < b.N; i++ {
-		buf := append([]byte(nil), ciphertext...)
-		if _, err := decryptHopPayload(key, buf, true); err != nil {
-			b.Fatalf("decryptHopPayload() error = %v", err)
-		}
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		b.Fatalf("chacha20poly1305.NewX() setup error = %v", err)
 	}
+
+	b.Run("key", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for i := 0; i < b.N; i++ {
+			buf := append([]byte(nil), ciphertext...)
+			if _, err := decryptHopPayload(key, buf, true); err != nil {
+				b.Fatalf("decryptHopPayload() error = %v", err)
+			}
+		}
+	})
+
+	b.Run("prepared", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for i := 0; i < b.N; i++ {
+			buf := append([]byte(nil), ciphertext...)
+			if _, err := decryptHopPayloadWithAEAD(aead, buf, true); err != nil {
+				b.Fatalf("decryptHopPayloadWithAEAD() error = %v", err)
+			}
+		}
+	})
 }
 
 func encryptHopPayloadForBenchmark(key []byte, payload []byte) ([]byte, error) {

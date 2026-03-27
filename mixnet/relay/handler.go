@@ -4,6 +4,7 @@ package relay
 import (
 	"bufio"
 	"context"
+	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -168,6 +169,7 @@ type Handler struct {
 	mu                      sync.RWMutex
 	muKeys                  sync.RWMutex
 	circuitKeys             map[string][]byte // circuitID -> hop key
+	circuitAEADs            map[string]cipher.AEAD
 	waitBandwidth           func(context.Context, int64) error
 	recordBandwidth         func(string, int64)
 	reportUtilization       func(int)
@@ -186,6 +188,7 @@ func NewHandler(host host.Host, maxCircuits int, maxBandwidth int64) *Handler {
 		activeRelays:            make(map[string]*RelayInfo),
 		protocolID:              ProtocolID,
 		circuitKeys:             make(map[string][]byte),
+		circuitAEADs:            make(map[string]cipher.AEAD),
 	}
 }
 
@@ -280,14 +283,14 @@ func (h *Handler) HandleStream(stream network.Stream) {
 				if len(key) == 0 {
 					return fmt.Errorf("missing circuit key")
 				}
-				return h.handleHeaderOnlyFrameStream(ctx, reader, circuitID, payloadLen, key, &dst, &dstPeer, &dstIsFinal, stream)
+				return h.handleHeaderOnlyFrameStream(ctx, reader, circuitID, payloadLen, key, h.getCircuitAEAD(circuitID), &dst, &dstPeer, &dstIsFinal, stream)
 			}
 			if frameVersion == frameVersionSessionSetupHeaderOnly || frameVersion == frameVersionSessionSetupFullOnion {
 				key := h.getCircuitKey(circuitID)
 				if len(key) == 0 {
 					return fmt.Errorf("missing circuit key")
 				}
-				return h.handleSessionSetupFrame(ctx, reader, circuitID, frameVersion, payloadLen, key, sessionRoutes, stream)
+				return h.handleSessionSetupFrame(ctx, reader, circuitID, frameVersion, payloadLen, key, h.getCircuitAEAD(circuitID), sessionRoutes, stream)
 			}
 			if frameVersion == frameVersionSessionDataHeaderOnly {
 				return h.handleSessionDataFrameStream(ctx, reader, circuitID, frameVersion, payloadLen, sessionRoutes, stream)
@@ -323,7 +326,7 @@ func (h *Handler) HandleStream(stream network.Stream) {
 				if len(key) == 0 {
 					return fmt.Errorf("missing circuit key")
 				}
-				plaintext, err := decryptHopPayload(key, encPayload, !observe)
+				plaintext, err := decryptHopPayloadPrepared(key, h.getCircuitAEAD(circuitID), encPayload, !observe)
 				if err != nil {
 					return err
 				}
@@ -436,7 +439,7 @@ func (h *Handler) HandleStream(stream network.Stream) {
 // It reads and decrypts only the encrypted onion header, learns the next hop,
 // and then streams the remaining payload bytes onward. The payload itself is
 // never reassembled into a new full-size buffer at intermediate relays.
-func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio.Reader, circuitID string, payloadLen int, key []byte, dst *network.Stream, dstPeer *peer.ID, dstIsFinal *bool, src network.Stream) error {
+func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio.Reader, circuitID string, payloadLen int, key []byte, hopAEAD cipher.AEAD, dst *network.Stream, dstPeer *peer.ID, dstIsFinal *bool, src network.Stream) error {
 	h.mu.RLock()
 	recordBandwidth := h.recordBandwidth
 	waitBandwidth := h.waitBandwidth
@@ -466,7 +469,7 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 	if recordBandwidth != nil {
 		recordBandwidth("in", int64(headerLen))
 	}
-	plaintext, err := decryptHopPayload(key, encryptedHeader, !observe)
+	plaintext, err := decryptHopPayloadPrepared(key, hopAEAD, encryptedHeader, !observe)
 	if err != nil {
 		return err
 	}
@@ -557,7 +560,7 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 	return err
 }
 
-func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Reader, circuitID string, frameVersion byte, payloadLen int, key []byte, sessionRoutes map[string]*sessionRouteEntry, src network.Stream) error {
+func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Reader, circuitID string, frameVersion byte, payloadLen int, key []byte, hopAEAD cipher.AEAD, sessionRoutes map[string]*sessionRouteEntry, src network.Stream) error {
 	payload, releasePayload := borrowRelayScratch(payloadLen)
 	defer releasePayload()
 	if _, err := io.ReadFull(reader, payload); err != nil {
@@ -580,7 +583,7 @@ func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Rea
 	if expected := sessionSetupFrameVersionForMode(mode); expected != frameVersion {
 		return fmt.Errorf("session setup mode/version mismatch: mode=%d version=%d", mode, frameVersion)
 	}
-	plaintext, err := decryptHopPayload(key, encryptedHeader, !observe)
+	plaintext, err := decryptHopPayloadPrepared(key, hopAEAD, encryptedHeader, !observe)
 	if err != nil {
 		return err
 	}
@@ -1645,6 +1648,23 @@ func decryptHopPayload(key []byte, payload []byte, allowInPlace bool) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
+	return decryptHopPayloadWithAEAD(aead, payload, allowInPlace)
+}
+
+func decryptHopPayloadPrepared(key []byte, aead cipher.AEAD, payload []byte, allowInPlace bool) ([]byte, error) {
+	if aead != nil {
+		return decryptHopPayloadWithAEAD(aead, payload, allowInPlace)
+	}
+	return decryptHopPayload(key, payload, allowInPlace)
+}
+
+func decryptHopPayloadWithAEAD(aead cipher.AEAD, payload []byte, allowInPlace bool) ([]byte, error) {
+	if len(payload) < nonceSize {
+		return nil, fmt.Errorf("payload too short")
+	}
+	if aead == nil {
+		return nil, fmt.Errorf("missing hop aead")
+	}
 	nonce := payload[:nonceSize]
 	ciphertext := payload[nonceSize:]
 	if allowInPlace {
@@ -1707,12 +1727,24 @@ func (h *Handler) setCircuitKey(circuitID string, key []byte) {
 	h.muKeys.Lock()
 	defer h.muKeys.Unlock()
 	h.circuitKeys[circuitID] = key
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		delete(h.circuitAEADs, circuitID)
+		return
+	}
+	h.circuitAEADs[circuitID] = aead
 }
 
 func (h *Handler) getCircuitKey(circuitID string) []byte {
 	h.muKeys.RLock()
 	defer h.muKeys.RUnlock()
 	return h.circuitKeys[circuitID]
+}
+
+func (h *Handler) getCircuitAEAD(circuitID string) cipher.AEAD {
+	h.muKeys.RLock()
+	defer h.muKeys.RUnlock()
+	return h.circuitAEADs[circuitID]
 }
 
 type rateLimitedWriter struct {
