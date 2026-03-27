@@ -75,21 +75,29 @@ var orderedGroups = []string{
 }
 
 type suiteOptions struct {
-	Profile     string
-	OutputDir   string
-	SizeSpec    string
-	HopSpec     string
-	CircuitSpec string
-	GroupSpec   string
-	Sizes       []int
-	Hops        []int
-	Circuits    []int
-	Groups      map[string]bool
-	Runs        int
-	VisualProof bool
+	Profile                      string
+	OutputDir                    string
+	SizeSpec                     string
+	HopSpec                      string
+	CircuitSpec                  string
+	GroupSpec                    string
+	NetworkProfile               string
+	NetworkLatencyOverrideMS     int
+	NetworkJitterOverrideMS      int
+	NetworkPacketLossOverridePct float64
+	NetworkBandwidthOverrideMbps int
+	Sizes                        []int
+	Hops                         []int
+	Circuits                     []int
+	Groups                       map[string]bool
+	Runs                         int
+	VisualProof                  bool
+	WarmupRuns                   int
 	// SizeRunOverrides allows a per-size run count override (bytes -> runs).
-	SizeRunOverrides map[int]int
-	Timeout          time.Duration
+	SizeRunOverrides  map[int]int
+	Timeout           time.Duration
+	SignificanceAlpha float64
+	NetworkCondition  NetworkCondition
 }
 
 type scenario struct {
@@ -144,6 +152,11 @@ type runRecord struct {
 	StreamDurationSec       int       `json:"stream_duration_sec"`
 	StreamWriteSizeBytes    int       `json:"stream_write_size_bytes"`
 	EnableSessionRouting    bool      `json:"enable_session_routing"`
+	NetworkProfile          string    `json:"network_profile"`
+	NetworkLatencyMS        int       `json:"network_latency_ms"`
+	NetworkJitterMS         int       `json:"network_jitter_ms"`
+	NetworkPacketLossPct    float64   `json:"network_packet_loss_pct"`
+	NetworkBandwidthMbps    int       `json:"network_bandwidth_mbps"`
 	SizeBytes               int       `json:"size_bytes"`
 	SizeLabel               string    `json:"size_label"`
 	RunIndex                int       `json:"run_index"`
@@ -188,6 +201,11 @@ type summaryRecord struct {
 	StreamDurationSec       int     `json:"stream_duration_sec"`
 	StreamWriteSizeBytes    int     `json:"stream_write_size_bytes"`
 	EnableSessionRouting    bool    `json:"enable_session_routing"`
+	NetworkProfile          string  `json:"network_profile"`
+	NetworkLatencyMS        int     `json:"network_latency_ms"`
+	NetworkJitterMS         int     `json:"network_jitter_ms"`
+	NetworkPacketLossPct    float64 `json:"network_packet_loss_pct"`
+	NetworkBandwidthMbps    int     `json:"network_bandwidth_mbps"`
 	SizeBytes               int     `json:"size_bytes"`
 	SizeLabel               string  `json:"size_label"`
 	HopCount                int     `json:"hop_count"`
@@ -325,10 +343,30 @@ func (o suiteOptions) normalize() (suiteOptions, error) {
 	if o.Runs < 1 {
 		return suiteOptions{}, fmt.Errorf("runs must be at least 1")
 	}
+	if o.WarmupRuns < 0 {
+		return suiteOptions{}, fmt.Errorf("warmup must be non-negative")
+	}
+	if o.SignificanceAlpha == 0 {
+		o.SignificanceAlpha = defaultSignificanceAlpha
+	}
+	if o.SignificanceAlpha <= 0 || o.SignificanceAlpha >= 1 {
+		return suiteOptions{}, fmt.Errorf("alpha must be between 0 and 1")
+	}
+	condition, err := resolveNetworkCondition(
+		o.NetworkProfile,
+		o.NetworkLatencyOverrideMS,
+		o.NetworkJitterOverrideMS,
+		o.NetworkPacketLossOverridePct,
+		o.NetworkBandwidthOverrideMbps,
+	)
+	if err != nil {
+		return suiteOptions{}, err
+	}
 	o.Sizes = sizes
 	o.Hops = hops
 	o.Circuits = circuits
 	o.Groups = groups
+	o.NetworkCondition = condition
 	if o.Timeout <= 0 {
 		o.Timeout = defaultRunTimeoutForSizes(sizes)
 	}
@@ -367,8 +405,8 @@ func runSuite(opts suiteOptions) error {
 	}
 
 	scenarios := buildScenarios(opts)
-	fmt.Printf("mixnet-bench: profile=%s scenarios=%d sizes=%d runs=%s output=%s\n",
-		opts.Profile, len(scenarios), len(opts.Sizes), opts.runsSummary(), opts.OutputDir)
+	fmt.Printf("mixnet-bench: profile=%s scenarios=%d sizes=%d runs=%s warmup=%d alpha=%.3f network=%s output=%s\n",
+		opts.Profile, len(scenarios), len(opts.Sizes), opts.runsSummary(), opts.WarmupRuns, opts.SignificanceAlpha, opts.NetworkCondition.Summary(), opts.OutputDir)
 
 	totalWork := 0
 	for _, sc := range scenarios {
@@ -381,6 +419,9 @@ func runSuite(opts suiteOptions) error {
 
 	for _, sc := range scenarios {
 		for _, size := range scenarioSizes(opts, sc) {
+			if err := warmupScenario(opts, sc, size); err != nil {
+				return err
+			}
 			runs := opts.runsForSize(size)
 			for runIdx := 1; runIdx <= runs; runIdx++ {
 				workIndex++
@@ -423,11 +464,25 @@ func runSuite(opts suiteOptions) error {
 			return err
 		}
 	}
-	if err := writeReport(opts.OutputDir, opts, summaries, best); err != nil {
+	if err := writeReport(opts.OutputDir, opts, runRecords, summaries, best); err != nil {
 		return err
 	}
 
 	fmt.Printf("mixnet-bench: complete. report=%s\n", filepath.Join(opts.OutputDir, "report.html"))
+	return nil
+}
+
+func warmupScenario(opts suiteOptions, sc scenario, size int) error {
+	if opts.WarmupRuns <= 0 {
+		return nil
+	}
+	for warmupIdx := 1; warmupIdx <= opts.WarmupRuns; warmupIdx++ {
+		fmt.Printf("[warmup %d/%d] %s size=%s\n", warmupIdx, opts.WarmupRuns, sc.ID, formatBytes(size))
+		if _, err := executeScenario(opts, sc, size, 0); err != nil {
+			return fmt.Errorf("warmup %d/%d for %s size=%s: %w", warmupIdx, opts.WarmupRuns, sc.ID, formatBytes(size), err)
+		}
+		releaseBenchmarkMemoryForSize(size)
+	}
 	return nil
 }
 
@@ -753,6 +808,11 @@ func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*run
 		StreamDurationSec:       sc.StreamDurationSec,
 		StreamWriteSizeBytes:    sc.StreamWriteSizeBytes,
 		EnableSessionRouting:    sc.EnableSessionRouting,
+		NetworkProfile:          opts.NetworkCondition.Name,
+		NetworkLatencyMS:        opts.NetworkCondition.LatencyMS,
+		NetworkJitterMS:         opts.NetworkCondition.JitterMS,
+		NetworkPacketLossPct:    opts.NetworkCondition.PacketLossPct,
+		NetworkBandwidthMbps:    opts.NetworkCondition.BandwidthMbps,
 		SizeBytes:               size,
 		SizeLabel:               formatBytes(size),
 		RunIndex:                runIdx,
@@ -795,6 +855,13 @@ func runDirectTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	if err != nil {
 		return err
 	}
+	simulator := newNetworkSimulator(NetworkCondition{
+		Name:          rec.NetworkProfile,
+		LatencyMS:     rec.NetworkLatencyMS,
+		JitterMS:      rec.NetworkJitterMS,
+		PacketLossPct: rec.NetworkPacketLossPct,
+		BandwidthMbps: rec.NetworkBandwidthMbps,
+	})
 	origin, err := newBenchHost()
 	if err != nil {
 		return err
@@ -837,6 +904,9 @@ func runDirectTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	})
 
 	connectStart := time.Now()
+	if err := simulator.connect(ctx, 1); err != nil {
+		return fmt.Errorf("simulate direct connect: %w", err)
+	}
 	if err := origin.Connect(ctx, destInfo); err != nil {
 		return fmt.Errorf("connect direct hosts: %w", err)
 	}
@@ -867,11 +937,11 @@ func runDirectTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 			_ = stream.Close()
 			return fmt.Errorf("encrypt direct payload chunk: %w", err)
 		}
-		if err := writeDirectFrame(stream, keyData); err != nil {
+		if err := writeDirectFrameWithSimulation(ctx, simulator, stream, keyData); err != nil {
 			_ = stream.Close()
 			return fmt.Errorf("write direct session key: %w", err)
 		}
-		if err := writeDirectFrame(stream, ciphertext); err != nil {
+		if err := writeDirectFrameWithSimulation(ctx, simulator, stream, ciphertext); err != nil {
 			_ = stream.Close()
 			return fmt.Errorf("write direct payload chunk: %w", err)
 		}
@@ -907,6 +977,13 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	if err != nil {
 		return err
 	}
+	simulator := newNetworkSimulator(NetworkCondition{
+		Name:          rec.NetworkProfile,
+		LatencyMS:     rec.NetworkLatencyMS,
+		JitterMS:      rec.NetworkJitterMS,
+		PacketLossPct: rec.NetworkPacketLossPct,
+		BandwidthMbps: rec.NetworkBandwidthMbps,
+	})
 	cfg, err := sc.config()
 	if err != nil {
 		return err
@@ -920,6 +997,9 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 	defer cleanup()
 
 	connectStart := time.Now()
+	if err := simulator.connect(ctx, maxInt(1, cfg.HopCount*cfg.CircuitCount)); err != nil {
+		return fmt.Errorf("simulate mixnet connect: %w", err)
+	}
 	circuits, err := origin.EstablishConnection(ctx, dest.Host().ID())
 	if err != nil {
 		return fmt.Errorf("establish connection: %w", err)
@@ -973,7 +1053,8 @@ func runMixnetTransfer(ctx context.Context, sc scenario, payload []byte, rec *ru
 		if end > len(wirePayload) {
 			end = len(wirePayload)
 		}
-		if _, err := originStream.Write(wirePayload[offset:end]); err != nil {
+		chunk := wirePayload[offset:end]
+		if err := simulator.transmit(ctx, len(chunk), func() error { return writeAll(originStream, chunk) }); err != nil {
 			return fmt.Errorf("write mixnet payload chunk: %w", err)
 		}
 	}
@@ -1085,7 +1166,7 @@ func exchangeDirectSessionKey(ctx context.Context, h host.Host, dest peer.ID, ke
 		return err
 	}
 	defer s.Close()
-	if _, err := s.Write(keyData); err != nil {
+	if err := writeAll(s, keyData); err != nil {
 		return err
 	}
 	if err := s.CloseWrite(); err != nil {
@@ -1163,14 +1244,31 @@ func decryptDirectChunk(session benchmarkSessionMaterial, chunkIndex uint64, cip
 	return aead.Open(nil, deriveChunkNonce(session.nonce, chunkIndex), ciphertext, nil)
 }
 
+func writeAll(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if err != nil {
+			return err
+		}
+		payload = payload[n:]
+	}
+	return nil
+}
+
 func writeDirectFrame(w io.Writer, payload []byte) error {
 	var lenBuf [4]byte
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
+	if err := writeAll(w, lenBuf[:]); err != nil {
 		return err
 	}
-	_, err := w.Write(payload)
-	return err
+	return writeAll(w, payload)
+}
+
+func writeDirectFrameWithSimulation(ctx context.Context, simulator *networkSimulator, w io.Writer, payload []byte) error {
+	frameSize := len(payload) + 4
+	return simulator.transmit(ctx, frameSize, func() error {
+		return writeDirectFrame(w, payload)
+	})
 }
 
 func readDirectFrame(r io.Reader) ([]byte, error) {
@@ -1755,6 +1853,11 @@ func summarizeRuns(records []*runRecord) ([]summaryRecord, error) {
 			StreamDurationSec:       base.StreamDurationSec,
 			StreamWriteSizeBytes:    base.StreamWriteSizeBytes,
 			EnableSessionRouting:    base.EnableSessionRouting,
+			NetworkProfile:          base.NetworkProfile,
+			NetworkLatencyMS:        base.NetworkLatencyMS,
+			NetworkJitterMS:         base.NetworkJitterMS,
+			NetworkPacketLossPct:    base.NetworkPacketLossPct,
+			NetworkBandwidthMbps:    base.NetworkBandwidthMbps,
 			SizeBytes:               base.SizeBytes,
 			SizeLabel:               base.SizeLabel,
 			HopCount:                base.HopCount,
@@ -1916,17 +2019,21 @@ func bestEfficiencySummaries(summaries []summaryRecord) []bestRecord {
 
 func writeMetadata(opts suiteOptions, scenarios []scenario) error {
 	meta := map[string]any{
-		"profile":     opts.Profile,
-		"generated":   time.Now().UTC().Format(time.RFC3339),
-		"runs":        opts.Runs,
-		"visualProof": opts.VisualProof,
-		"sizes":       opts.Sizes,
-		"hops":        opts.Hops,
-		"circuits":    opts.Circuits,
-		"groups":      sortedGroupNames(opts.Groups),
-		"timeout":     opts.Timeout.String(),
-		"scenarios":   scenarios,
-		"outlierRule": describeOutlierRuleWithOverrides(opts.Runs, opts.SizeRunOverrides),
+		"profile":           opts.Profile,
+		"generated":         time.Now().UTC().Format(time.RFC3339),
+		"runs":              opts.Runs,
+		"warmupRuns":        opts.WarmupRuns,
+		"significanceAlpha": opts.SignificanceAlpha,
+		"visualProof":       opts.VisualProof,
+		"sizes":             opts.Sizes,
+		"hops":              opts.Hops,
+		"circuits":          opts.Circuits,
+		"groups":            sortedGroupNames(opts.Groups),
+		"timeout":           opts.Timeout.String(),
+		"networkProfile":    opts.NetworkCondition.Name,
+		"networkCondition":  opts.NetworkCondition,
+		"scenarios":         scenarios,
+		"outlierRule":       describeOutlierRuleWithOverrides(opts.Runs, opts.SizeRunOverrides),
 	}
 	if len(opts.SizeRunOverrides) > 0 {
 		meta["sizeRunOverrides"] = opts.SizeRunOverrides
@@ -1963,7 +2070,7 @@ func writeRawRecords(outputDir string, records []*runRecord) error {
 	defer csvFile.Close()
 	writer := csv.NewWriter(csvFile)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "network_profile", "network_latency_ms", "network_jitter_ms", "network_packet_loss_pct", "network_bandwidth_mbps", "size_bytes", "size_label", "run_index", "timestamp_utc", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "connect_ms", "key_exchange_ms", "transfer_ms", "pipeline_process_ms", "pipeline_reconstruct_ms", "total_ms", "per_hop_ms", "throughput_mib_per_s", "excluded"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
@@ -1971,6 +2078,7 @@ func writeRawRecords(outputDir string, records []*runRecord) error {
 		row := []string{
 			rec.ScenarioID, rec.Category, rec.Label, rec.Measurement, rec.Mode, rec.StreamProfile, rec.StreamKind, rec.StreamQuality, strconv.FormatBool(rec.StreamWrites),
 			strconv.Itoa(rec.StreamBitrateKbps), strconv.Itoa(rec.StreamSegmentMS), strconv.Itoa(rec.StreamDurationSec), strconv.Itoa(rec.StreamWriteSizeBytes), strconv.FormatBool(rec.EnableSessionRouting),
+			rec.NetworkProfile, strconv.Itoa(rec.NetworkLatencyMS), strconv.Itoa(rec.NetworkJitterMS), fmt.Sprintf("%.2f", rec.NetworkPacketLossPct), strconv.Itoa(rec.NetworkBandwidthMbps),
 			strconv.Itoa(rec.SizeBytes), rec.SizeLabel, strconv.Itoa(rec.RunIndex), rec.TimestampUTC.Format(time.RFC3339),
 			strconv.Itoa(rec.HopCount), strconv.Itoa(rec.CircuitCount), strconv.FormatBool(rec.UseCESPipeline), strconv.FormatBool(rec.UseCSE), strconv.FormatBool(rec.UseCompressionOnly),
 			rec.Compression, strconv.Itoa(rec.ErasureThreshold), fmt.Sprintf("%.2f", rec.ErasureThresholdPercent),
@@ -2003,7 +2111,7 @@ func writeSummaryRecords(outputDir string, summaries []summaryRecord) error {
 	defer file.Close()
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
+	header := []string{"scenario_id", "category", "label", "measurement", "mode", "stream_profile", "stream_kind", "stream_quality", "stream_writes", "stream_bitrate_kbps", "stream_segment_ms", "stream_duration_sec", "stream_write_size_bytes", "enable_session_routing", "network_profile", "network_latency_ms", "network_jitter_ms", "network_packet_loss_pct", "network_bandwidth_mbps", "size_bytes", "size_label", "hop_count", "circuit_count", "use_ces_pipeline", "use_cse", "use_compression_only", "compression", "erasure_threshold", "erasure_threshold_percent", "selection_mode", "payload_padding_strategy", "header_padding_enabled", "enable_auth_tag", "max_jitter_ms", "total_runs", "kept_runs", "excluded_run_index", "connect_mean_ms", "connect_stddev_ms", "key_exchange_mean_ms", "key_exchange_stddev_ms", "transfer_mean_ms", "transfer_stddev_ms", "pipeline_process_mean_ms", "pipeline_process_stddev_ms", "pipeline_reconstruct_mean_ms", "pipeline_reconstruct_stddev_ms", "total_mean_ms", "total_stddev_ms", "per_hop_mean_ms", "per_hop_stddev_ms", "throughput_mean_mib_per_s", "throughput_stddev_mib_per_s"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
@@ -2011,6 +2119,7 @@ func writeSummaryRecords(outputDir string, summaries []summaryRecord) error {
 		row := []string{
 			s.ScenarioID, s.Category, s.Label, s.Measurement, s.Mode, s.StreamProfile, s.StreamKind, s.StreamQuality, strconv.FormatBool(s.StreamWrites),
 			strconv.Itoa(s.StreamBitrateKbps), strconv.Itoa(s.StreamSegmentMS), strconv.Itoa(s.StreamDurationSec), strconv.Itoa(s.StreamWriteSizeBytes), strconv.FormatBool(s.EnableSessionRouting),
+			s.NetworkProfile, strconv.Itoa(s.NetworkLatencyMS), strconv.Itoa(s.NetworkJitterMS), fmt.Sprintf("%.2f", s.NetworkPacketLossPct), strconv.Itoa(s.NetworkBandwidthMbps),
 			strconv.Itoa(s.SizeBytes), s.SizeLabel, strconv.Itoa(s.HopCount), strconv.Itoa(s.CircuitCount),
 			strconv.FormatBool(s.UseCESPipeline), strconv.FormatBool(s.UseCSE), strconv.FormatBool(s.UseCompressionOnly), s.Compression, strconv.Itoa(s.ErasureThreshold), fmt.Sprintf("%.2f", s.ErasureThresholdPercent),
 			s.SelectionMode, s.PayloadPaddingStrategy, strconv.FormatBool(s.HeaderPaddingEnabled), strconv.FormatBool(s.EnableAuthTag), strconv.Itoa(s.MaxJitterMS),

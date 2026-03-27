@@ -64,6 +64,7 @@ require (
 	golang.org/x/sys v0.41.0
 	golang.org/x/time v0.12.0
 	golang.org/x/tools v0.41.0
+	gonum.org/v1/gonum v0.15.1
 	google.golang.org/protobuf v1.36.6
 )
 

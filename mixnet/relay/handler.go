@@ -53,6 +53,41 @@ var relayChunkPool = sync.Pool{
 	},
 }
 
+func borrowRelayScratch(size int) ([]byte, func()) {
+	if size <= 0 {
+		return nil, func() {}
+	}
+
+	bufPtr := relayChunkPool.Get().(*[]byte)
+	buf := *bufPtr
+	if cap(buf) < size {
+		relayChunkPool.Put(bufPtr)
+		return make([]byte, size), func() {}
+	}
+
+	buf = buf[:size]
+	return buf, func() {
+		*bufPtr = (*bufPtr)[:cap(*bufPtr)]
+		relayChunkPool.Put(bufPtr)
+	}
+}
+
+func assembleRelayPayload(parts ...[]byte) ([]byte, func()) {
+	total := 0
+	for _, part := range parts {
+		total += len(part)
+	}
+	buf, release := borrowRelayScratch(total)
+	if total == 0 {
+		return buf, release
+	}
+	offset := 0
+	for _, part := range parts {
+		offset += copy(buf[offset:], part)
+	}
+	return buf[:total], release
+}
+
 const (
 	msgTypeData                byte = 0x00
 	msgTypeCloseReq            byte = 0x01
@@ -419,7 +454,8 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 	if headerLen <= 0 || payloadLen < 4+headerLen {
 		return fmt.Errorf("invalid header length")
 	}
-	encryptedHeader := make([]byte, headerLen)
+	encryptedHeader, releaseHeader := borrowRelayScratch(headerLen)
+	defer releaseHeader()
 	if _, err := io.ReadFull(reader, encryptedHeader); err != nil {
 		return err
 	}
@@ -480,13 +516,9 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 		writer = &rateLimitedWriter{w: *dst, bytesPerSec: maxBandwidth}
 	}
 	if isFinal {
-		// At the destination-facing hop we still prepend the control header, but
-		// the data payload is streamed from the inbound relay stream directly into
-		// the final stream instead of being copied into a new combined buffer.
-		if _, err := writePayloadWithBandwidth(ctx, writer, []byte{msgTypeData}, 1, waitBandwidth, recordBandwidth); err != nil {
-			return err
-		}
-		if _, err := writePayloadWithBandwidth(ctx, writer, innerHeader, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
+		finalPayload, releaseFinal := assembleRelayPayload([]byte{msgTypeData}, innerHeader)
+		defer releaseFinal()
+		if _, err := writePayloadWithBandwidth(ctx, writer, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 			return err
 		}
 		if _, err := pipePayloadWithBandwidth(ctx, reader, writer, dataPayloadLen, waitBandwidth, recordBandwidth); err != nil {
@@ -520,7 +552,8 @@ func (h *Handler) handleHeaderOnlyFrameStream(ctx context.Context, reader *bufio
 }
 
 func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Reader, circuitID string, frameVersion byte, payloadLen int, key []byte, sessionRoutes map[string]*sessionRouteEntry, src network.Stream) error {
-	payload := make([]byte, payloadLen)
+	payload, releasePayload := borrowRelayScratch(payloadLen)
+	defer releasePayload()
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return err
 	}
@@ -589,7 +622,8 @@ func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Rea
 		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 	}
 	if isFinal {
-		finalPayload := append([]byte{msgTypeSessionSetup}, innerPayload...)
+		finalPayload, releaseFinal := assembleRelayPayload([]byte{msgTypeSessionSetup}, innerPayload)
+		defer releaseFinal()
 		if _, err := writePayloadWithBandwidth(ctx, writer, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 			_ = dst.Close()
 			return err
@@ -612,7 +646,8 @@ func (h *Handler) handleSessionSetupFrame(ctx context.Context, reader *bufio.Rea
 }
 
 func (h *Handler) handleSessionDataFrame(ctx context.Context, reader *bufio.Reader, circuitID string, frameVersion byte, payloadLen int, sessionRoutes map[string]*sessionRouteEntry, src network.Stream) error {
-	payload := make([]byte, payloadLen)
+	payload, releasePayload := borrowRelayScratch(payloadLen)
+	defer releasePayload()
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return err
 	}
@@ -658,9 +693,8 @@ func (h *Handler) handleSessionDataFrame(ctx context.Context, reader *bufio.Read
 		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 	}
 	if route.isFinal {
-		finalPayload := make([]byte, 1+len(payload))
-		finalPayload[0] = msgTypeSessionData
-		copy(finalPayload[1:], payload)
+		finalPayload, releaseFinal := assembleRelayPayload(route.finalTemplate, payload)
+		defer releaseFinal()
 		if _, err := writePayloadWithBandwidth(ctx, writer, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 			_ = dst.Close()
 			return err
@@ -719,7 +753,9 @@ func (h *Handler) handleSessionDataFrameStream(ctx context.Context, reader *bufi
 		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 	}
 	if route.isFinal {
-		if _, err := writePayloadWithBandwidth(ctx, writer, append(route.finalTemplate, controlPrefix...), writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
+		finalPayload, releaseFinal := assembleRelayPayload(route.finalTemplate, controlPrefix)
+		defer releaseFinal()
+		if _, err := writePayloadWithBandwidth(ctx, writer, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 			_ = dst.Close()
 			return err
 		}
@@ -742,7 +778,8 @@ func (h *Handler) handleSessionDataFrameStream(ctx context.Context, reader *bufi
 }
 
 func (h *Handler) handleSessionCloseFrame(ctx context.Context, reader *bufio.Reader, circuitID string, payloadLen int, sessionRoutes map[string]*sessionRouteEntry) error {
-	payload := make([]byte, payloadLen)
+	payload, releasePayload := borrowRelayScratch(payloadLen)
+	defer releasePayload()
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return err
 	}
@@ -773,9 +810,8 @@ func (h *Handler) handleSessionCloseFrame(ctx context.Context, reader *bufio.Rea
 		writer = &rateLimitedWriter{w: dst, bytesPerSec: maxBandwidth}
 	}
 	if route.isFinal {
-		finalPayload := make([]byte, 1+len(payload))
-		finalPayload[0] = msgTypeSessionClose
-		copy(finalPayload[1:], payload)
+		finalPayload, releaseFinal := assembleRelayPayload([]byte{msgTypeSessionClose}, payload)
+		defer releaseFinal()
 		if _, err := writePayloadWithBandwidth(ctx, writer, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth); err != nil {
 			_ = dst.Close()
 			return err
@@ -980,13 +1016,14 @@ func writeEncryptedFrameHeaderOnlyPayloadPrefix(ctx context.Context, w io.Writer
 	if len(circuitID) == 0 || len(circuitID) > 255 {
 		return 0, fmt.Errorf("invalid circuit id")
 	}
-	frameHeader := make([]byte, 1+len(circuitID)+1+4)
+	var frameHeader [1 + 255 + 1 + 4]byte
+	frameHeaderLen := 1 + len(circuitID) + 1 + 4
 	frameHeader[0] = byte(len(circuitID))
-	copy(frameHeader[1:], []byte(circuitID))
+	copy(frameHeader[1:], circuitID)
 	frameHeader[1+len(circuitID)] = version
 	binary.LittleEndian.PutUint32(frameHeader[1+len(circuitID)+1:], uint32(payloadLen))
 
-	total, err := writePayloadWithBandwidth(ctx, w, frameHeader, len(frameHeader), waitBandwidth, recordBandwidth)
+	total, err := writePayloadWithBandwidth(ctx, w, frameHeader[:frameHeaderLen], frameHeaderLen, waitBandwidth, recordBandwidth)
 	if err != nil {
 		return total, err
 	}
@@ -1008,16 +1045,18 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	if payloadLen < 1 {
 		return "", nil, 0, fmt.Errorf("session data payload too short")
 	}
-	baseLenBuf := make([]byte, 1)
-	if err := readTracked(baseLenBuf); err != nil {
+	var baseLenBuf [1]byte
+	if err := readTracked(baseLenBuf[:]); err != nil {
 		return "", nil, 0, err
 	}
 	baseLen := int(baseLenBuf[0])
 	if payloadLen < 1+baseLen+1+4+4+2 {
 		return "", nil, 0, fmt.Errorf("session data payload truncated")
 	}
-	prefix := append([]byte(nil), baseLenBuf...)
-	baseAndFlags := make([]byte, baseLen+1)
+	prefix := make([]byte, 0, payloadLen)
+	prefix = append(prefix, baseLenBuf[:]...)
+	baseAndFlags, releaseBaseAndFlags := borrowRelayScratch(baseLen + 1)
+	defer releaseBaseAndFlags()
 	if err := readTracked(baseAndFlags); err != nil {
 		return "", nil, 0, err
 	}
@@ -1025,23 +1064,24 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	baseID := string(baseAndFlags[:baseLen])
 	flags := baseAndFlags[baseLen]
 	if flags&sessionDataFlagSequenced != 0 {
-		seqBuf := make([]byte, 8)
-		if err := readTracked(seqBuf); err != nil {
+		var seqBuf [8]byte
+		if err := readTracked(seqBuf[:]); err != nil {
 			return "", nil, 0, err
 		}
-		prefix = append(prefix, seqBuf...)
+		prefix = append(prefix, seqBuf[:]...)
 	}
-	metaBuf := make([]byte, 10)
-	if err := readTracked(metaBuf); err != nil {
+	var metaBuf [10]byte
+	if err := readTracked(metaBuf[:]); err != nil {
 		return "", nil, 0, err
 	}
-	prefix = append(prefix, metaBuf...)
+	prefix = append(prefix, metaBuf[:]...)
 	authLen := int(binary.LittleEndian.Uint16(metaBuf[8:10]))
 	if payloadLen < len(prefix)+authLen {
 		return "", nil, 0, fmt.Errorf("invalid session data auth length")
 	}
 	if authLen > 0 {
-		authBuf := make([]byte, authLen)
+		authBuf, releaseAuth := borrowRelayScratch(authLen)
+		defer releaseAuth()
 		if err := readTracked(authBuf); err != nil {
 			return "", nil, 0, err
 		}
@@ -1333,7 +1373,8 @@ func readEncryptedFrameHeader(r *bufio.Reader) (string, byte, int, error) {
 	if cidLen == 0 {
 		return "", 0, 0, fmt.Errorf("empty circuit id")
 	}
-	cid := make([]byte, int(cidLen))
+	var cidBuf [255]byte
+	cid := cidBuf[:cidLen]
 	if _, err := io.ReadFull(r, cid); err != nil {
 		return "", 0, 0, err
 	}
@@ -1341,11 +1382,11 @@ func readEncryptedFrameHeader(r *bufio.Reader) (string, byte, int, error) {
 	if err != nil {
 		return "", 0, 0, err
 	}
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(r, lenBuf); err != nil {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return "", 0, 0, err
 	}
-	payloadLen := int(binary.LittleEndian.Uint32(lenBuf))
+	payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 	maxPayloadSize := MaxEncryptedPayloadSize()
 	if payloadLen <= 0 || payloadLen > maxPayloadSize {
 		return "", 0, 0, fmt.Errorf("invalid encrypted payload length")
@@ -1354,15 +1395,23 @@ func readEncryptedFrameHeader(r *bufio.Reader) (string, byte, int, error) {
 }
 
 func readEncryptedFramePayload(r *bufio.Reader, scope network.StreamScope, payloadLen int) ([]byte, func(), error) {
-	release := func() {}
+	payload, releaseScratch := borrowRelayScratch(payloadLen)
+
+	// Reserve memory based on actual buffer capacity to correctly account for pooled buffers
+	releaseMemory := func() {}
 	if scope != nil {
-		if err := scope.ReserveMemory(payloadLen, network.ReservationPriorityMedium); err != nil {
+		actualCapacity := cap(payload)
+		if err := scope.ReserveMemory(actualCapacity, network.ReservationPriorityMedium); err != nil {
+			releaseScratch()
 			return nil, nil, fmt.Errorf("rcmgr inbound memory reservation failed: %w", err)
 		}
-		release = func() { scope.ReleaseMemory(payloadLen) }
+		releaseMemory = func() { scope.ReleaseMemory(actualCapacity) }
 	}
 
-	payload := make([]byte, payloadLen)
+	release := func() {
+		releaseScratch()
+		releaseMemory()
+	}
 	if _, err := io.ReadFull(r, payload); err != nil {
 		release()
 		return nil, nil, err
@@ -1378,12 +1427,13 @@ func writeEncryptedFrame(ctx context.Context, w io.Writer, circuitID string, ver
 	if len(payload) > maxPayloadSize {
 		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", len(payload), maxPayloadSize)
 	}
-	header := make([]byte, 1+len(circuitID)+1+4)
+	var header [1 + 255 + 1 + 4]byte
+	headerLen := 1 + len(circuitID) + 1 + 4
 	header[0] = byte(len(circuitID))
-	copy(header[1:], []byte(circuitID))
+	copy(header[1:], circuitID)
 	header[1+len(circuitID)] = version
 	binary.LittleEndian.PutUint32(header[1+len(circuitID)+1:], uint32(len(payload)))
-	hn, err := writePayloadWithBandwidth(ctx, w, header, len(header), waitBandwidth, recordBandwidth)
+	hn, err := writePayloadWithBandwidth(ctx, w, header[:headerLen], headerLen, waitBandwidth, recordBandwidth)
 	if err != nil {
 		return hn, err
 	}
@@ -1426,20 +1476,21 @@ func writeHeaderOnlyFramePrefix(ctx context.Context, w io.Writer, circuitID stri
 		return 0, fmt.Errorf("payload too large: %d bytes exceeds limit of %d", payloadLen, maxPayloadSize)
 	}
 
-	frameHeader := make([]byte, 1+len(circuitID)+1+4)
+	var frameHeader [1 + 255 + 1 + 4]byte
+	frameHeaderLen := 1 + len(circuitID) + 1 + 4
 	frameHeader[0] = byte(len(circuitID))
-	copy(frameHeader[1:], []byte(circuitID))
+	copy(frameHeader[1:], circuitID)
 	frameHeader[1+len(circuitID)] = frameVersionHeaderOnly
 	binary.LittleEndian.PutUint32(frameHeader[1+len(circuitID)+1:], uint32(payloadLen))
 
-	headerOnlyPrefix := make([]byte, 4)
-	binary.LittleEndian.PutUint32(headerOnlyPrefix, uint32(len(encryptedHeader)))
+	var headerOnlyPrefix [4]byte
+	binary.LittleEndian.PutUint32(headerOnlyPrefix[:], uint32(len(encryptedHeader)))
 
-	total, err := writePayloadWithBandwidth(ctx, w, frameHeader, len(frameHeader), waitBandwidth, recordBandwidth)
+	total, err := writePayloadWithBandwidth(ctx, w, frameHeader[:frameHeaderLen], frameHeaderLen, waitBandwidth, recordBandwidth)
 	if err != nil {
 		return total, err
 	}
-	n, err := writePayloadWithBandwidth(ctx, w, headerOnlyPrefix, len(headerOnlyPrefix), waitBandwidth, recordBandwidth)
+	n, err := writePayloadWithBandwidth(ctx, w, headerOnlyPrefix[:], len(headerOnlyPrefix), waitBandwidth, recordBandwidth)
 	total += n
 	if err != nil {
 		return total, err
@@ -1450,18 +1501,13 @@ func writeHeaderOnlyFramePrefix(ctx context.Context, w io.Writer, circuitID stri
 }
 
 func writeHeaderOnlyFinalPayload(ctx context.Context, w io.Writer, controlHeader []byte, dataPayload []byte, waitBandwidth func(context.Context, int64) error, recordBandwidth func(string, int64)) (int, error) {
-	total, err := writePayloadWithBandwidth(ctx, w, []byte{msgTypeData}, 1, waitBandwidth, recordBandwidth)
+	finalPayload, release := assembleRelayPayload([]byte{msgTypeData}, controlHeader, dataPayload)
+	defer release()
+	total, err := writePayloadWithBandwidth(ctx, w, finalPayload, writeChunkSize, waitBandwidth, recordBandwidth)
 	if err != nil {
 		return total, err
 	}
-	n, err := writePayloadWithBandwidth(ctx, w, controlHeader, writeChunkSize, waitBandwidth, recordBandwidth)
-	total += n
-	if err != nil {
-		return total, err
-	}
-	n, err = writePayloadWithBandwidth(ctx, w, dataPayload, writeChunkSize, waitBandwidth, recordBandwidth)
-	total += n
-	return total, err
+	return total, nil
 }
 
 // pipePayloadWithBandwidth copies payload bytes from the inbound relay stream
