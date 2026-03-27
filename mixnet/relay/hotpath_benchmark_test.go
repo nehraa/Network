@@ -21,7 +21,7 @@ func BenchmarkDecryptHopPayload(b *testing.B) {
 	b.SetBytes(int64(len(plaintext)))
 	for i := 0; i < b.N; i++ {
 		buf := append([]byte(nil), ciphertext...)
-		if _, err := decryptHopPayload(key, buf); err != nil {
+		if _, err := decryptHopPayload(key, buf, true); err != nil {
 			b.Fatalf("decryptHopPayload() error = %v", err)
 		}
 	}
