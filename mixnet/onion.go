@@ -1,6 +1,7 @@
 package mixnet
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -44,6 +45,40 @@ func encryptOnion(payload []byte, c *circuit.Circuit, dest peer.ID, hopKeys [][]
 	return current, nil
 }
 
+func encryptOnionWithAEADs(payload []byte, c *circuit.Circuit, dest peer.ID, hopAEADs []cipher.AEAD) ([]byte, error) {
+	if c == nil || len(c.Peers) == 0 {
+		return nil, fmt.Errorf("empty circuit")
+	}
+	if len(hopAEADs) != len(c.Peers) {
+		return nil, fmt.Errorf("hop aead count mismatch")
+	}
+
+	current := payload
+	for i := len(c.Peers) - 1; i >= 0; i-- {
+		isFinal := byte(0)
+		nextHop := ""
+		if i == len(c.Peers)-1 {
+			isFinal = 1
+			nextHop = dest.String()
+		} else {
+			nextHop = c.Peers[i+1].String()
+		}
+		enc, err := encryptWrappedHopPayloadWithAEAD(hopAEADs[i], isFinal, nextHop, current)
+		if err != nil {
+			return nil, err
+		}
+		current = enc
+	}
+	return current, nil
+}
+
+func encryptOnionPrepared(payload []byte, c *circuit.Circuit, dest peer.ID, hopKeys [][]byte, hopAEADs []cipher.AEAD) ([]byte, error) {
+	if c != nil && len(hopAEADs) == len(c.Peers) {
+		return encryptOnionWithAEADs(payload, c, dest, hopAEADs)
+	}
+	return encryptOnion(payload, c, dest, hopKeys)
+}
+
 func buildHopPayload(isFinal byte, nextHop string, payload []byte) ([]byte, error) {
 	if len(nextHop) > 65535 {
 		return nil, fmt.Errorf("next hop too long")
@@ -77,12 +112,19 @@ func encryptWrappedHopPayload(key []byte, isFinal byte, nextHop string, payload 
 	if len(key) != 32 {
 		return nil, fmt.Errorf("invalid hop key length")
 	}
-	if len(nextHop) > 65535 {
-		return nil, fmt.Errorf("next hop too long")
-	}
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
+	}
+	return encryptWrappedHopPayloadWithAEAD(aead, isFinal, nextHop, payload)
+}
+
+func encryptWrappedHopPayloadWithAEAD(aead cipher.AEAD, isFinal byte, nextHop string, payload []byte) ([]byte, error) {
+	if aead == nil {
+		return nil, fmt.Errorf("missing hop aead")
+	}
+	if len(nextHop) > 65535 {
+		return nil, fmt.Errorf("next hop too long")
 	}
 	plainLen := 1 + 2 + len(nextHop) + len(payload)
 	nonceSize := aead.NonceSize()
@@ -97,6 +139,18 @@ func encryptWrappedHopPayload(key []byte, isFinal byte, nextHop string, payload 
 	copy(plain[3:], nextHop)
 	copy(plain[3+len(nextHop):], payload)
 	return aead.Seal(out[:nonceSize], nonce, plain, nil), nil
+}
+
+func prepareHopAEADs(hopKeys [][]byte) ([]cipher.AEAD, error) {
+	hopAEADs := make([]cipher.AEAD, len(hopKeys))
+	for i, key := range hopKeys {
+		aead, err := chacha20poly1305.NewX(key)
+		if err != nil {
+			return nil, err
+		}
+		hopAEADs[i] = aead
+	}
+	return hopAEADs, nil
 }
 
 func encodeEncryptedFrame(circuitID string, payload []byte) ([]byte, error) {

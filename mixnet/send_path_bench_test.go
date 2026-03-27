@@ -72,18 +72,40 @@ func BenchmarkEncryptOnion(b *testing.B) {
 		bytes.Repeat([]byte{0x33}, 32),
 	}
 	payload := bytes.Repeat([]byte("mixnet-onion-payload-"), 192)
-
-	b.ReportAllocs()
-	b.SetBytes(int64(len(payload)))
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		encrypted, err := encryptOnion(payload, c, dest, hopKeys)
-		if err != nil {
-			b.Fatalf("encryptOnion() error = %v", err)
-		}
-		if len(encrypted) == 0 {
-			b.Fatal("expected encrypted onion bytes")
-		}
+	hopAEADs, err := prepareHopAEADs(hopKeys)
+	if err != nil {
+		b.Fatalf("prepareHopAEADs() error = %v", err)
 	}
+
+	b.Run("keys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(payload)))
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			encrypted, err := encryptOnion(payload, c, dest, hopKeys)
+			if err != nil {
+				b.Fatalf("encryptOnion() error = %v", err)
+			}
+			if len(encrypted) == 0 {
+				b.Fatal("expected encrypted onion bytes")
+			}
+		}
+	})
+
+	b.Run("prepared", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(payload)))
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			encrypted, err := encryptOnionWithAEADs(payload, c, dest, hopAEADs)
+			if err != nil {
+				b.Fatalf("encryptOnionWithAEADs() error = %v", err)
+			}
+			if len(encrypted) == 0 {
+				b.Fatal("expected encrypted onion bytes")
+			}
+		}
+	})
 }

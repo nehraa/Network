@@ -1,6 +1,7 @@
 package mixnet
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 
@@ -35,6 +36,40 @@ func encryptOnionHeader(controlHeader []byte, c *circuit.Circuit, dest peer.ID, 
 		current = enc
 	}
 	return current, nil
+}
+
+func encryptOnionHeaderWithAEADs(controlHeader []byte, c *circuit.Circuit, dest peer.ID, hopAEADs []cipher.AEAD) ([]byte, error) {
+	if c == nil || len(c.Peers) == 0 {
+		return nil, fmt.Errorf("empty circuit")
+	}
+	if len(hopAEADs) != len(c.Peers) {
+		return nil, fmt.Errorf("hop aead count mismatch")
+	}
+
+	current := controlHeader
+	for i := len(c.Peers) - 1; i >= 0; i-- {
+		isFinal := byte(0)
+		nextHop := ""
+		if i == len(c.Peers)-1 {
+			isFinal = 1
+			nextHop = dest.String()
+		} else {
+			nextHop = c.Peers[i+1].String()
+		}
+		enc, err := encryptWrappedHopPayloadWithAEAD(hopAEADs[i], isFinal, nextHop, current)
+		if err != nil {
+			return nil, err
+		}
+		current = enc
+	}
+	return current, nil
+}
+
+func encryptOnionHeaderPrepared(controlHeader []byte, c *circuit.Circuit, dest peer.ID, hopKeys [][]byte, hopAEADs []cipher.AEAD) ([]byte, error) {
+	if c != nil && len(hopAEADs) == len(c.Peers) {
+		return encryptOnionHeaderWithAEADs(controlHeader, c, dest, hopAEADs)
+	}
+	return encryptOnionHeader(controlHeader, c, dest, hopKeys)
 }
 
 // buildHeaderOnlyPayload builds the header-only packet body.

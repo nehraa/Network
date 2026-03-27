@@ -143,54 +143,81 @@ func encodeSessionDataFramePayload(baseSessionID string, hasSeq bool, seq uint64
 	if shard == nil {
 		return nil, fmt.Errorf("missing shard")
 	}
-	prefix, err := buildSessionDataFrameControlPrefix(baseSessionID, hasSeq, seq, shard.Index, totalShards, len(authTag))
+	prefixLen, err := sessionDataControlPrefixLen(baseSessionID, hasSeq, shard.Index, totalShards, len(authTag))
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, len(prefix)+len(authTag)+len(shard.Data))
-	copy(buf, prefix)
-	pos := len(prefix)
+	buf := make([]byte, prefixLen+len(authTag)+len(shard.Data))
+	pos, err := writeSessionDataFrameControlPrefix(buf, baseSessionID, hasSeq, seq, shard.Index, totalShards, len(authTag))
+	if err != nil {
+		return nil, err
+	}
 	pos += copy(buf[pos:], authTag)
 	copy(buf[pos:], shard.Data)
 	return buf, nil
 }
 
 func buildSessionDataFrameControlPrefix(baseSessionID string, hasSeq bool, seq uint64, shardIndex int, totalShards int, authTagLen int) ([]byte, error) {
+	prefixLen, err := sessionDataControlPrefixLen(baseSessionID, hasSeq, shardIndex, totalShards, authTagLen)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, prefixLen)
+	_, err = writeSessionDataFrameControlPrefix(buf, baseSessionID, hasSeq, seq, shardIndex, totalShards, authTagLen)
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func sessionDataControlPrefixLen(baseSessionID string, hasSeq bool, shardIndex int, totalShards int, authTagLen int) (int, error) {
 	if len(baseSessionID) > 0xff {
-		return nil, fmt.Errorf("base session id too long: %d", len(baseSessionID))
+		return 0, fmt.Errorf("base session id too long: %d", len(baseSessionID))
 	}
 	if shardIndex < 0 {
-		return nil, fmt.Errorf("invalid shard index: %d", shardIndex)
+		return 0, fmt.Errorf("invalid shard index: %d", shardIndex)
 	}
 	if totalShards < 0 {
-		return nil, fmt.Errorf("invalid total shards: %d", totalShards)
+		return 0, fmt.Errorf("invalid total shards: %d", totalShards)
 	}
 	if authTagLen < 0 || authTagLen > 0xffff {
-		return nil, fmt.Errorf("auth tag too large: %d", authTagLen)
+		return 0, fmt.Errorf("auth tag too large: %d", authTagLen)
 	}
-	flags := byte(0)
 	seqLen := 0
 	if hasSeq {
-		flags |= sessionDataFlagSequenced
 		seqLen = 8
 	}
-	buf := make([]byte, 1+len(baseSessionID)+1+seqLen+4+4+2)
+	return 1 + len(baseSessionID) + 1 + seqLen + 4 + 4 + 2, nil
+}
+
+func writeSessionDataFrameControlPrefix(dst []byte, baseSessionID string, hasSeq bool, seq uint64, shardIndex int, totalShards int, authTagLen int) (int, error) {
+	prefixLen, err := sessionDataControlPrefixLen(baseSessionID, hasSeq, shardIndex, totalShards, authTagLen)
+	if err != nil {
+		return 0, err
+	}
+	if len(dst) < prefixLen {
+		return 0, fmt.Errorf("session data control destination too small: have %d, need %d", len(dst), prefixLen)
+	}
+	flags := byte(0)
+	if hasSeq {
+		flags |= sessionDataFlagSequenced
+	}
 	pos := 0
-	buf[pos] = byte(len(baseSessionID))
+	dst[pos] = byte(len(baseSessionID))
 	pos++
-	pos += copy(buf[pos:], baseSessionID)
-	buf[pos] = flags
+	pos += copy(dst[pos:], baseSessionID)
+	dst[pos] = flags
 	pos++
 	if hasSeq {
-		binary.LittleEndian.PutUint64(buf[pos:], seq)
+		binary.LittleEndian.PutUint64(dst[pos:], seq)
 		pos += 8
 	}
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(shardIndex))
+	binary.LittleEndian.PutUint32(dst[pos:], uint32(shardIndex))
 	pos += 4
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(totalShards))
+	binary.LittleEndian.PutUint32(dst[pos:], uint32(totalShards))
 	pos += 4
-	binary.LittleEndian.PutUint16(buf[pos:], uint16(authTagLen))
-	return buf, nil
+	binary.LittleEndian.PutUint16(dst[pos:], uint16(authTagLen))
+	return prefixLen, nil
 }
 
 func decodeSessionDataFramePayload(data []byte) (string, bool, uint64, *ces.Shard, int, []byte, error) {

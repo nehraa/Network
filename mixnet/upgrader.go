@@ -2,6 +2,7 @@ package mixnet
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -44,6 +45,7 @@ type Mixnet struct {
 	metricsExporter *MetricsExporter
 	resourceMgr     *ResourceManager
 	circuitKeys     map[string][][]byte
+	circuitAEADs    map[string][]cipher.AEAD
 	failureNotifier *CircuitFailureNotifier
 	heartbeatStart  map[string]struct{}
 
@@ -266,6 +268,7 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 		metricsExporter:   metricsExporter,
 		resourceMgr:       resourceMgr,
 		circuitKeys:       make(map[string][][]byte),
+		circuitAEADs:      make(map[string][]cipher.AEAD),
 		heartbeatStart:    make(map[string]struct{}),
 		originCtx:         originCtx,
 		originCancel:      originCancel,
@@ -821,7 +824,8 @@ func (m *Mixnet) sendSessionSetupAcrossCircuits(ctx context.Context, dest peer.I
 		if !ok {
 			return ErrEncryptionFailed(fmt.Sprintf("missing hop keys for circuit %s", circuitID))
 		}
-		onionHeader, err := encryptOnionHeader(setupData, circuits[idx], dest, hopKeys)
+		hopAEADs, _ := m.getCircuitAEADs(keyID)
+		onionHeader, err := encryptOnionHeaderPrepared(setupData, circuits[idx], dest, hopKeys, hopAEADs)
 		if err != nil {
 			return ErrEncryptionFailed(fmt.Sprintf("failed to encrypt session setup for circuit %s", circuitID)).WithCause(err)
 		}
@@ -2163,6 +2167,12 @@ func (m *Mixnet) setCircuitKeys(circuitID string, keys [][]byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.circuitKeys[circuitID] = keys
+	hopAEADs, err := prepareHopAEADs(keys)
+	if err != nil {
+		delete(m.circuitAEADs, circuitID)
+		return
+	}
+	m.circuitAEADs[circuitID] = hopAEADs
 }
 
 func (m *Mixnet) getCircuitKeys(circuitID string) ([][]byte, bool) {
@@ -2170,6 +2180,13 @@ func (m *Mixnet) getCircuitKeys(circuitID string) ([][]byte, bool) {
 	defer m.mu.RUnlock()
 	keys, ok := m.circuitKeys[circuitID]
 	return keys, ok
+}
+
+func (m *Mixnet) getCircuitAEADs(circuitID string) ([]cipher.AEAD, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	hopAEADs, ok := m.circuitAEADs[circuitID]
+	return hopAEADs, ok
 }
 
 func (m *Mixnet) clearCircuitKeys() {
@@ -2181,6 +2198,7 @@ func (m *Mixnet) clearCircuitKeys() {
 			keys[i] = nil
 		}
 		delete(m.circuitKeys, id)
+		delete(m.circuitAEADs, id)
 	}
 }
 
@@ -2225,7 +2243,8 @@ func (m *Mixnet) sendCloseAndWait(ctx context.Context, circuitID string) error {
 		}
 		m.setCircuitKeys(keyID, keys)
 	}
-	encryptedPayload, err := encryptOnion([]byte{msgTypeCloseReq}, c, dest, keys)
+	hopAEADs, _ := m.getCircuitAEADs(keyID)
+	encryptedPayload, err := encryptOnionPrepared([]byte{msgTypeCloseReq}, c, dest, keys, hopAEADs)
 	if err != nil {
 		return err
 	}
@@ -2728,6 +2747,7 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 				resultCh <- shardSendResult{circuitID: circuitID, err: ErrEncryptionFailed(fmt.Sprintf("missing hop keys for circuit %s", circuitID))}
 				return
 			}
+			hopAEADs, _ := m.getCircuitAEADs(keyID)
 			// Apply per-stream write deadline (Req 8.2).
 			if stream, ok := m.circuitMgr.GetStream(circuitID); ok && stream != nil {
 				stream.Stream().SetDeadline(time.Now().Add(configuredStreamTimeout(30 * time.Second)))
@@ -2752,7 +2772,7 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 					resultCh <- shardSendResult{circuitID: circuitID, err: ErrProtocolError("failed to encode control header").WithCause(err)}
 					return
 				}
-				onionHeader, err := encryptOnionHeader(controlHeader, circuits[idx], dest, hopKeys)
+				onionHeader, err := encryptOnionHeaderPrepared(controlHeader, circuits[idx], dest, hopKeys, hopAEADs)
 				if err != nil {
 					resultCh <- shardSendResult{circuitID: circuitID, err: ErrEncryptionFailed(fmt.Sprintf("failed to encrypt header for circuit %s", circuitID)).WithCause(err)}
 					return
@@ -2781,7 +2801,7 @@ func (m *Mixnet) sendShardsAcrossCircuits(ctx context.Context, dest peer.ID, ses
 					return
 				}
 				shardPayload := append([]byte{msgTypeData}, privacyShard...)
-				encryptedPayload, err := encryptOnion(shardPayload, circuits[idx], dest, hopKeys)
+				encryptedPayload, err := encryptOnionPrepared(shardPayload, circuits[idx], dest, hopKeys, hopAEADs)
 				if err != nil {
 					resultCh <- shardSendResult{circuitID: circuitID, err: ErrEncryptionFailed(fmt.Sprintf("failed to encrypt shard for circuit %s", circuitID)).WithCause(err)}
 					return
