@@ -186,24 +186,41 @@ func (s *Sharder) Reconstruct(shards []*Shard) ([]byte, error) {
 		return nil, fmt.Errorf("failed to reconstruct: %w", err)
 	}
 
-	// Join only the data shards (first threshold shards).
+	// Read the 8-byte original-length prefix directly from the reconstructed
+	// data shards, then copy only the actual payload bytes into the final output.
 	dataShards := s.threshold
-	shardSize := len(shardData[0])
-	combined := make([]byte, 0, dataShards*shardSize)
-	for i := 0; i < dataShards; i++ {
-		combined = append(combined, shardData[i]...)
+	var lenPrefix [8]byte
+	prefixCopied := 0
+	for i := 0; i < dataShards && prefixCopied < len(lenPrefix); i++ {
+		prefixCopied += copy(lenPrefix[prefixCopied:], shardData[i])
 	}
-
-	// Extract original length from the 8-byte prefix.
-	if len(combined) < 8 {
+	if prefixCopied < len(lenPrefix) {
 		return nil, fmt.Errorf("reconstructed data too short to contain length prefix")
 	}
-	origLen := binary.LittleEndian.Uint64(combined[:8])
-	payload := combined[8:]
-	if uint64(len(payload)) < origLen {
-		return nil, fmt.Errorf("reconstructed payload shorter than expected: got %d, want %d", len(payload), origLen)
+
+	origLen := binary.LittleEndian.Uint64(lenPrefix[:])
+	if origLen > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("reconstructed payload too large: %d", origLen)
 	}
-	return payload[:origLen], nil
+	payload := make([]byte, int(origLen))
+	payloadOffset := 0
+	remainingPrefix := len(lenPrefix)
+	for i := 0; i < dataShards && uint64(payloadOffset) < origLen; i++ {
+		chunk := shardData[i]
+		if remainingPrefix >= len(chunk) {
+			remainingPrefix -= len(chunk)
+			continue
+		}
+		if remainingPrefix > 0 {
+			chunk = chunk[remainingPrefix:]
+			remainingPrefix = 0
+		}
+		payloadOffset += copy(payload[payloadOffset:], chunk)
+	}
+	if uint64(payloadOffset) < origLen {
+		return nil, fmt.Errorf("reconstructed payload shorter than expected: got %d, want %d", payloadOffset, origLen)
+	}
+	return payload, nil
 }
 
 // Threshold returns the minimum number of shards required to reconstruct the original data.

@@ -3,6 +3,7 @@ package mixnet
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -180,83 +181,56 @@ func DefaultPrivacyPaddingConfig() *PrivacyPaddingConfig {
 
 // EncodePrivacyShard encodes a shard with privacy-enhanced header.
 func EncodePrivacyShard(shardData []byte, header PrivacyShardHeader, paddingCfg *PrivacyPaddingConfig) ([]byte, error) {
-	// Build header without destination
-	// Format: [session_len(1)][session_id][shard_idx(4)][total_shards(4)][has_keys(1)][key_len(4)][keys][auth_len(2)][auth][padding_len(2)][padding][shard]
-
-	var headerBytes []byte
-
-	// session_len + session_id
-	headerBytes = append(headerBytes, byte(len(header.SessionID)))
-	headerBytes = append(headerBytes, header.SessionID...)
-
-	// shard_index (4 bytes)
-	idxBytes := make([]byte, 4)
-	idxBytes[0] = byte(header.ShardIndex)
-	idxBytes[1] = byte(header.ShardIndex >> 8)
-	idxBytes[2] = byte(header.ShardIndex >> 16)
-	idxBytes[3] = byte(header.ShardIndex >> 24)
-	headerBytes = append(headerBytes, idxBytes...)
-
-	// total_shards (4 bytes)
-	totalBytes := make([]byte, 4)
-	totalBytes[0] = byte(header.TotalShards)
-	totalBytes[1] = byte(header.TotalShards >> 8)
-	totalBytes[2] = byte(header.TotalShards >> 16)
-	totalBytes[3] = byte(header.TotalShards >> 24)
-	headerBytes = append(headerBytes, totalBytes...)
-
-	// has_keys (1 byte)
-	if header.HasKeys {
-		headerBytes = append(headerBytes, 1)
-	} else {
-		headerBytes = append(headerBytes, 0)
-	}
-
-	// key_len + key_data
-	keyLen := uint32(0)
-	if header.KeyData != nil {
-		keyLen = uint32(len(header.KeyData))
-	}
-	keyLenBytes := make([]byte, 4)
-	keyLenBytes[0] = byte(keyLen)
-	keyLenBytes[1] = byte(keyLen >> 8)
-	keyLenBytes[2] = byte(keyLen >> 16)
-	keyLenBytes[3] = byte(keyLen >> 24)
-	headerBytes = append(headerBytes, keyLenBytes...)
-
-	if keyLen > 0 {
-		headerBytes = append(headerBytes, header.KeyData...)
-	}
-
-	// auth_len + auth_tag
-	authLen := uint16(0)
-	if header.AuthTag != nil {
-		if len(header.AuthTag) > int(^uint16(0)) {
-			return nil, fmt.Errorf("auth tag too large")
-		}
-		authLen = uint16(len(header.AuthTag))
-	}
-	headerBytes = append(headerBytes, byte(authLen), byte(authLen>>8))
-	if authLen > 0 {
-		headerBytes = append(headerBytes, header.AuthTag...)
-	}
-
-	// Add padding if enabled
+	// Format:
+	// [session_len(1)][session_id][shard_idx(4)][total_shards(4)][has_keys(1)]
+	// [key_len(4)][keys][auth_len(2)][auth][padding_len(2)][padding][shard]
+	var padding []byte
 	if paddingCfg != nil && paddingCfg.Enabled {
-		padding := generateRandomPadding(paddingCfg.MinBytes, paddingCfg.MaxBytes)
+		padding = generateRandomPadding(paddingCfg.MinBytes, paddingCfg.MaxBytes)
 		header.Padding = padding
-
-		paddingLen := uint16(len(padding))
-		headerBytes = append(headerBytes, byte(paddingLen))
-		headerBytes = append(headerBytes, byte(paddingLen>>8))
-		headerBytes = append(headerBytes, padding...)
-	} else {
-		// No padding - write 0 length
-		headerBytes = append(headerBytes, 0, 0)
 	}
 
-	// Append actual shard data
-	return append(headerBytes, shardData...), nil
+	keyLen := len(header.KeyData)
+	if keyLen > 0 && !header.HasKeys {
+		header.HasKeys = true
+	}
+	authLen := len(header.AuthTag)
+	if authLen > int(^uint16(0)) {
+		return nil, fmt.Errorf("auth tag too large")
+	}
+
+	totalLen := 1 + len(header.SessionID) + 4 + 4 + 1 + 4 + keyLen + 2 + authLen + 2 + len(padding) + len(shardData)
+	buf := make([]byte, totalLen)
+	offset := 0
+
+	buf[offset] = byte(len(header.SessionID))
+	offset++
+	offset += copy(buf[offset:], header.SessionID)
+
+	binary.LittleEndian.PutUint32(buf[offset:], header.ShardIndex)
+	offset += 4
+	binary.LittleEndian.PutUint32(buf[offset:], header.TotalShards)
+	offset += 4
+
+	if header.HasKeys {
+		buf[offset] = 1
+	}
+	offset++
+
+	binary.LittleEndian.PutUint32(buf[offset:], uint32(keyLen))
+	offset += 4
+	offset += copy(buf[offset:], header.KeyData)
+
+	binary.LittleEndian.PutUint16(buf[offset:], uint16(authLen))
+	offset += 2
+	offset += copy(buf[offset:], header.AuthTag)
+
+	binary.LittleEndian.PutUint16(buf[offset:], uint16(len(padding)))
+	offset += 2
+	offset += copy(buf[offset:], padding)
+
+	copy(buf[offset:], shardData)
+	return buf, nil
 }
 
 // DecodePrivacyShard decodes a privacy-enhanced shard header.

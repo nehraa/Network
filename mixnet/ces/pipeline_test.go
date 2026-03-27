@@ -33,3 +33,24 @@ func TestCESPipelineRoundTrip(t *testing.T) {
 		t.Fatalf("round trip mismatch")
 	}
 }
+
+func TestSharderReconstructHandlesSplitLengthPrefix(t *testing.T) {
+	sharder := NewSharder(10, 9)
+	payload := []byte("x")
+
+	shards, err := sharder.Shard(payload)
+	if err != nil {
+		t.Fatalf("Shard() error = %v", err)
+	}
+	if len(shards) < 9 {
+		t.Fatalf("expected at least 9 shards, got %d", len(shards))
+	}
+
+	reconstructed, err := sharder.Reconstruct(shards[:9])
+	if err != nil {
+		t.Fatalf("Reconstruct() error = %v", err)
+	}
+	if !bytes.Equal(reconstructed, payload) {
+		t.Fatalf("reconstructed payload = %q, want %q", reconstructed, payload)
+	}
+}

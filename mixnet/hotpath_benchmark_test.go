@@ -1,0 +1,61 @@
+package mixnet
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/libp2p/go-libp2p/mixnet/ces"
+)
+
+func BenchmarkEncodePrivacyShardVariablePadding(b *testing.B) {
+	payload := bytes.Repeat([]byte("mixnet-privacy-payload-"), 128)
+	header := PrivacyShardHeader{
+		SessionID:   []byte("bench-session"),
+		ShardIndex:  2,
+		TotalShards: 5,
+		HasKeys:     true,
+		KeyData:     bytes.Repeat([]byte{0x11}, 57),
+		AuthTag:     bytes.Repeat([]byte{0x22}, 16),
+	}
+	paddingCfg := &PrivacyPaddingConfig{Enabled: true, MinBytes: 16, MaxBytes: 32}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		if _, err := EncodePrivacyShard(payload, header, paddingCfg); err != nil {
+			b.Fatalf("EncodePrivacyShard() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkEncryptHopPayload(b *testing.B) {
+	payload, err := buildHopPayload(0, "peer-next-hop", bytes.Repeat([]byte("mixnet-hop-payload-"), 96))
+	if err != nil {
+		b.Fatalf("buildHopPayload() error = %v", err)
+	}
+	key := bytes.Repeat([]byte{0x33}, 32)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		if _, err := encryptHopPayload(key, payload); err != nil {
+			b.Fatalf("encryptHopPayload() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkSessionDataFramePayload(b *testing.B) {
+	shard := &ces.Shard{
+		Index: 1,
+		Data:  bytes.Repeat([]byte("mixnet-session-shard-"), 128),
+	}
+	authTag := bytes.Repeat([]byte{0x44}, 16)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(shard.Data)))
+	for i := 0; i < b.N; i++ {
+		if _, err := encodeSessionDataFramePayload("bench-session", true, 42, shard, 4, authTag); err != nil {
+			b.Fatalf("encodeSessionDataFramePayload() error = %v", err)
+		}
+	}
+}

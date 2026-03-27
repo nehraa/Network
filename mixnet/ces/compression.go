@@ -149,7 +149,16 @@ func (c *gzipCompressor) Decompress(data []byte) ([]byte, error) {
 	}
 	defer state.reader.Close()
 
-	return io.ReadAll(state.reader)
+	buf := c.bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer c.bufferPool.Put(buf)
+	if _, err := buf.ReadFrom(state.reader); err != nil {
+		return nil, fmt.Errorf("failed to decompress: %w", err)
+	}
+
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
 }
 
 // snappyCompressor implements the Compressor interface using the Snappy algorithm.

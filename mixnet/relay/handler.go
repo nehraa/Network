@@ -1053,7 +1053,7 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	if payloadLen < 1+baseLen+1+4+4+2 {
 		return "", nil, 0, fmt.Errorf("session data payload truncated")
 	}
-	prefix := make([]byte, 0, payloadLen)
+	prefix := make([]byte, 0, 1+baseLen+1+8+4+4+2)
 	prefix = append(prefix, baseLenBuf[:]...)
 	baseAndFlags, releaseBaseAndFlags := borrowRelayScratch(baseLen + 1)
 	defer releaseBaseAndFlags()
@@ -1080,6 +1080,11 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 		return "", nil, 0, fmt.Errorf("invalid session data auth length")
 	}
 	if authLen > 0 {
+		if cap(prefix)-len(prefix) < authLen {
+			grown := make([]byte, len(prefix), len(prefix)+authLen)
+			copy(grown, prefix)
+			prefix = grown
+		}
 		authBuf, releaseAuth := borrowRelayScratch(authLen)
 		defer releaseAuth()
 		if err := readTracked(authBuf); err != nil {

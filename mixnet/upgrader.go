@@ -94,6 +94,7 @@ type DestinationHandler struct {
 	shardBuf        map[string]map[int]*ces.Shard
 	shardTags       map[string]map[int][]byte
 	totalShards     map[string]int
+	reconstructing  map[string]*reconstructionCall
 	timers          map[string]*time.Timer
 	setupTimers     map[string]*time.Timer
 	sessions        map[string]*sessionMailbox
@@ -120,6 +121,30 @@ type sessionMailbox struct {
 	ch     chan []byte
 	sendMu sync.Mutex
 	closed bool
+}
+
+type reconstructionCall struct {
+	done   chan struct{}
+	result reconstructionResult
+}
+
+type reconstructionResult struct {
+	data []byte
+	err  error
+}
+
+type reconstructionSnapshot struct {
+	sessionID       string
+	pipeline        *ces.CESPipeline
+	shardsByIndex   map[int]*ces.Shard
+	shardTags       map[int][]byte
+	totalShards     int
+	threshold       int
+	key             sessionKey
+	keyPayload      []byte
+	useLengthPrefix bool
+	authEnabled     bool
+	authTagSize     int
 }
 
 // Large stream benchmarks can deliver a high number of session fragments before
@@ -253,6 +278,7 @@ func NewMixnet(cfg *MixnetConfig, h host.Host, r routing.Routing) (*Mixnet, erro
 			shardBuf:        make(map[string]map[int]*ces.Shard),
 			shardTags:       make(map[string]map[int][]byte),
 			totalShards:     make(map[string]int),
+			reconstructing:  make(map[string]*reconstructionCall),
 			timers:          make(map[string]*time.Timer),
 			setupTimers:     make(map[string]*time.Timer),
 			sessions:        make(map[string]*sessionMailbox),
@@ -799,15 +825,16 @@ func (m *Mixnet) sendSessionSetupAcrossCircuits(ctx context.Context, dest peer.I
 		if err != nil {
 			return ErrEncryptionFailed(fmt.Sprintf("failed to encrypt session setup for circuit %s", circuitID)).WithCause(err)
 		}
-		framePayload, err := encodeSessionSetupFramePayload(baseID, mode, onionHeader, keyData)
+		controlPrefix, keyPrefix, err := buildSessionSetupFrameControlParts(baseID, mode, len(onionHeader), len(keyData))
 		if err != nil {
 			return ErrProtocolError("failed to frame session setup").WithCause(err)
 		}
-		frameHeader, err := buildEncryptedFrameHeader(keyID, sessionSetupFrameVersion(mode), len(framePayload))
+		framePayloadLen := len(controlPrefix) + len(onionHeader) + len(keyPrefix) + len(keyData)
+		frameHeader, err := buildEncryptedFrameHeader(keyID, sessionSetupFrameVersion(mode), framePayloadLen)
 		if err != nil {
 			return ErrProtocolError("failed to build session setup header").WithCause(err)
 		}
-		if err := m.circuitMgr.SendDataParts(circuitID, frameHeader, framePayload); err != nil {
+		if err := m.circuitMgr.SendDataParts(circuitID, frameHeader, controlPrefix, onionHeader, keyPrefix, keyData); err != nil {
 			return ErrTransportFailed(fmt.Sprintf("failed to send setup on circuit %s", circuitID)).WithCause(err)
 		}
 		m.markRouteSetup(baseID, circuitID)
@@ -854,19 +881,23 @@ func (m *Mixnet) sendSessionDataAcrossCircuits(ctx context.Context, dest peer.ID
 }
 
 func (m *Mixnet) sendSessionDataFrameOnCircuit(baseID string, hasSeq bool, seq uint64, shard *ces.Shard, totalShards int, c *circuit.Circuit, authTag []byte, mode sessionRouteMode) error {
-	framePayload, err := encodeSessionDataFramePayload(baseID, hasSeq, seq, shard, totalShards, authTag)
+	if shard == nil {
+		return ErrProtocolError("failed to encode session data").WithCause(fmt.Errorf("missing shard"))
+	}
+	controlPrefix, err := buildSessionDataFrameControlPrefix(baseID, hasSeq, seq, shard.Index, totalShards, len(authTag))
 	if err != nil {
 		return ErrProtocolError("failed to encode session data").WithCause(err)
 	}
 	keyID := m.circuitKeyID(c)
-	frameHeader, err := buildEncryptedFrameHeader(keyID, sessionDataFrameVersion(mode), len(framePayload))
+	framePayloadLen := len(controlPrefix) + len(authTag) + len(shard.Data)
+	frameHeader, err := buildEncryptedFrameHeader(keyID, sessionDataFrameVersion(mode), framePayloadLen)
 	if err != nil {
 		return ErrProtocolError("failed to build session data header").WithCause(err)
 	}
-	if err := m.circuitMgr.SendDataParts(c.ID, frameHeader, framePayload); err != nil {
+	if err := m.circuitMgr.SendDataParts(c.ID, frameHeader, controlPrefix, authTag, shard.Data); err != nil {
 		return err
 	}
-	m.metrics.RecordThroughput(uint64(len(frameHeader) + len(framePayload)))
+	m.metrics.RecordThroughput(uint64(len(frameHeader) + framePayloadLen))
 	return nil
 }
 
@@ -1386,6 +1417,12 @@ func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard, keyDat
 		h.timers[sessionID] = time.AfterFunc(h.timeout, func() {
 			h.mu.Lock()
 			defer h.mu.Unlock()
+			if _, reconstructing := h.reconstructing[sessionID]; reconstructing {
+				if t, ok := h.timers[sessionID]; ok {
+					t.Reset(h.timeout)
+				}
+				return
+			}
 			delete(h.shardBuf, sessionID)
 			delete(h.shardTags, sessionID)
 			delete(h.totalShards, sessionID)
@@ -1452,149 +1489,61 @@ func (h *DestinationHandler) AddShard(sessionID string, shard *ces.Shard, keyDat
 // TryReconstruct attempts to reconstruct the original data from buffered shards.
 func (h *DestinationHandler) TryReconstruct(sessionID string) ([]byte, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	shardsByIndex := h.shardBuf[sessionID]
-	shardCount := len(shardsByIndex)
-
-	var (
-		decrypted []byte
-		err       error
-	)
-	if h.pipeline == nil {
-		key, ok := h.sessionKeyFor(sessionID)
-		if !ok {
-			if _, hasFirstShard := shardsByIndex[0]; !hasFirstShard {
-				return nil, ErrReconstructionMissingShards(sessionID, shardCount, h.threshold, []int{0})
-			}
-			return nil, ErrEncryptionFailed(fmt.Sprintf("missing session key for %s", sessionID))
-		}
-		// CES disabled: require all shards and concatenate in index order.
-		total := h.totalShards[sessionID]
-		if total <= 0 {
-			total = shardCount
-		}
-		missing := missingShardIndexes(shardsByIndex, total)
-		if shardCount < total {
-			return nil, ErrReconstructionMissingShards(sessionID, shardCount, total, missing)
-		}
-		if total == 1 {
-			sh := shardsByIndex[0]
-			if sh == nil {
-				return nil, ErrReconstructionMissingShards(sessionID, shardCount, total, missing)
-			}
-			if key.Mode == sessionCryptoModePerShard || key.Mode == sessionCryptoModePerShardStream {
-				decrypted = sh.Data
-			} else {
-				if h.authEnabled {
-					if err := h.verifyAuthTags(sessionID, shardsByIndex, total, key); err != nil {
-						return nil, err
-					}
-				}
-				decrypted, err = decryptSessionPayloadWithKey(sh.Data, key, sessionID)
-				if err != nil {
-					return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
-				}
-			}
-		} else {
-			combinedLen := 0
-			for i := 0; i < total; i++ {
-				sh := shardsByIndex[i]
-				if sh == nil {
-					return nil, ErrReconstructionMissingShards(sessionID, shardCount, total, missing)
-				}
-				combinedLen += len(sh.Data)
-			}
-			combined := make([]byte, combinedLen)
-			offset := 0
-			for i := 0; i < total; i++ {
-				sh := shardsByIndex[i]
-				offset += copy(combined[offset:], sh.Data)
-			}
-			if key.Mode == sessionCryptoModePerShard || key.Mode == sessionCryptoModePerShardStream {
-				decrypted = combined
-			} else {
-				if h.authEnabled {
-					if err := h.verifyAuthTags(sessionID, shardsByIndex, total, key); err != nil {
-						return nil, err
-					}
-				}
-				decrypted, err = decryptSessionPayloadWithKey(combined, key, sessionID)
-				if err != nil {
-					return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
-				}
-			}
-		}
-	} else {
-		key, ok := h.sessionKeyFor(sessionID)
-		if !ok {
-			if _, hasFirstShard := shardsByIndex[0]; !hasFirstShard {
-				return nil, ErrReconstructionMissingShards(sessionID, shardCount, h.threshold, []int{0})
-			}
-			return nil, ErrEncryptionFailed(fmt.Sprintf("missing session key for %s", sessionID))
-		}
-		total := h.totalShards[sessionID]
-		if total <= 0 {
-			total = h.pipeline.Sharder().TotalShards()
-		}
-		missing := missingShardIndexes(shardsByIndex, total)
-		if shardCount < h.threshold {
-			return nil, ErrReconstructionMissingShards(sessionID, shardCount, h.threshold, missing)
-		}
-		if h.authEnabled {
-			if err := h.verifyAuthTags(sessionID, shardsByIndex, total, key); err != nil {
-				return nil, err
-			}
-		}
-		unique := make([]*ces.Shard, 0, shardCount)
-		for _, sh := range shardsByIndex {
-			if sh != nil {
-				unique = append(unique, sh)
-			}
-		}
-		encrypted, err := h.pipeline.Sharder().Reconstruct(unique)
-		if err != nil {
-			return nil, ErrShardingFailed(fmt.Sprintf("reconstruction failed for session %s missing_shard_ids=%v", sessionID, missing)).WithCause(err)
-		}
-		decrypted, err = decryptSessionPayloadWithKey(encrypted, key, sessionID)
-		if err != nil {
-			return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
-		}
+	if h.reconstructing == nil {
+		h.reconstructing = make(map[string]*reconstructionCall)
+	}
+	if call, ok := h.reconstructing[sessionID]; ok {
+		h.mu.Unlock()
+		<-call.done
+		return call.result.data, call.result.err
 	}
 
-	data := decrypted
-	if h.useLengthPrefix {
-		data, err = stripLengthPrefix(data)
-		if err != nil {
-			return nil, ErrProtocolError("invalid length prefix").WithCause(err)
-		}
-	}
-	if h.pipeline != nil {
-		data, err = h.pipeline.Compressor().Decompress(data)
-		if err != nil {
-			return nil, err
-		}
+	snapshot, err := h.prepareReconstructionLocked(sessionID)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, err
 	}
 
-	if t, ok := h.timers[sessionID]; ok {
-		t.Stop()
-		delete(h.timers, sessionID)
+	call := &reconstructionCall{done: make(chan struct{})}
+	h.reconstructing[sessionID] = call
+	h.mu.Unlock()
+
+	data, err := snapshot.reconstruct()
+
+	h.mu.Lock()
+	if err == nil {
+		if t, ok := h.timers[sessionID]; ok {
+			t.Stop()
+			delete(h.timers, sessionID)
+		}
+		h.markSessionCompletedLocked(sessionID)
+		delete(h.shardBuf, sessionID)
+		delete(h.shardTags, sessionID)
+		delete(h.keys, sessionID)
+		delete(h.keyData, sessionID)
+		delete(h.totalShards, sessionID)
 	}
-	h.markSessionCompletedLocked(sessionID)
-	delete(h.shardBuf, sessionID)
-	delete(h.shardTags, sessionID)
-	delete(h.keys, sessionID)
-	delete(h.keyData, sessionID)
-	delete(h.totalShards, sessionID)
-	return data, nil
+	h.mu.Unlock()
+
+	call.result = reconstructionResult{data: data, err: err}
+	close(call.done)
+
+	h.mu.Lock()
+	delete(h.reconstructing, sessionID)
+	h.mu.Unlock()
+
+	return data, err
 }
 
 func (h *DestinationHandler) verifyAuthTags(sessionID string, shardsByIndex map[int]*ces.Shard, total int, key sessionKey) error {
-	tags := h.shardTags[sessionID]
+	keyPayload, _ := h.inlineKeyDataFor(sessionID)
+	return verifyAuthTagsWithState(sessionID, shardsByIndex, h.shardTags[sessionID], total, key, keyPayload, h.authTagSize)
+}
+
+func verifyAuthTagsWithState(sessionID string, shardsByIndex map[int]*ces.Shard, tags map[int][]byte, total int, key sessionKey, keyPayload []byte, authTagSize int) error {
 	if tags == nil {
 		return ErrEncryptionFailed(fmt.Sprintf("missing auth tags for %s", sessionID))
 	}
-	keyPayload, _ := h.inlineKeyDataFor(sessionID)
 	for _, sh := range shardsByIndex {
 		tag, ok := tags[sh.Index]
 		if !ok {
@@ -1605,12 +1554,176 @@ func (h *DestinationHandler) verifyAuthTags(sessionID string, shardsByIndex map[
 		if includeKeys {
 			payload = keyPayload
 		}
-		expected := computeAuthTag(key, []byte(sessionID), uint32(sh.Index), uint32(total), sh.Data, includeKeys, payload, h.authTagSize)
+		expected := computeAuthTag(key, []byte(sessionID), uint32(sh.Index), uint32(total), sh.Data, includeKeys, payload, authTagSize)
 		if !hmacEqual(tag, expected) {
 			return ErrEncryptionFailed(fmt.Sprintf("auth tag mismatch for shard %d", sh.Index))
 		}
 	}
 	return nil
+}
+
+func (h *DestinationHandler) prepareReconstructionLocked(sessionID string) (reconstructionSnapshot, error) {
+	shardsByIndex := h.shardBuf[sessionID]
+	shardCount := len(shardsByIndex)
+	key, ok := h.sessionKeyFor(sessionID)
+	if !ok {
+		if _, hasFirstShard := shardsByIndex[0]; !hasFirstShard {
+			return reconstructionSnapshot{}, ErrReconstructionMissingShards(sessionID, shardCount, h.threshold, []int{0})
+		}
+		return reconstructionSnapshot{}, ErrEncryptionFailed(fmt.Sprintf("missing session key for %s", sessionID))
+	}
+
+	snapshot := reconstructionSnapshot{
+		sessionID:       sessionID,
+		pipeline:        h.pipeline,
+		shardsByIndex:   cloneShardIndexMap(shardsByIndex),
+		totalShards:     h.totalShards[sessionID],
+		threshold:       h.threshold,
+		key:             key,
+		useLengthPrefix: h.useLengthPrefix,
+		authEnabled:     h.authEnabled,
+		authTagSize:     h.authTagSize,
+	}
+
+	if snapshot.totalShards <= 0 {
+		if h.pipeline == nil {
+			snapshot.totalShards = shardCount
+		} else {
+			snapshot.totalShards = h.pipeline.Sharder().TotalShards()
+		}
+	}
+	if h.authEnabled {
+		snapshot.shardTags = cloneAuthTagMap(h.shardTags[sessionID])
+		if keyPayload, ok := h.inlineKeyDataFor(sessionID); ok {
+			snapshot.keyPayload = append([]byte(nil), keyPayload...)
+		}
+	}
+
+	missing := missingShardIndexes(snapshot.shardsByIndex, snapshot.totalShards)
+	if h.pipeline == nil {
+		if shardCount < snapshot.totalShards {
+			return reconstructionSnapshot{}, ErrReconstructionMissingShards(sessionID, shardCount, snapshot.totalShards, missing)
+		}
+		return snapshot, nil
+	}
+	if shardCount < h.threshold {
+		return reconstructionSnapshot{}, ErrReconstructionMissingShards(sessionID, shardCount, h.threshold, missing)
+	}
+	return snapshot, nil
+}
+
+func (s reconstructionSnapshot) reconstruct() ([]byte, error) {
+	var (
+		decrypted []byte
+		err       error
+	)
+
+	if s.pipeline == nil {
+		if s.totalShards == 1 {
+			sh := s.shardsByIndex[0]
+			if sh == nil {
+				return nil, ErrReconstructionMissingShards(s.sessionID, len(s.shardsByIndex), s.totalShards, []int{0})
+			}
+			if s.key.Mode == sessionCryptoModePerShard || s.key.Mode == sessionCryptoModePerShardStream {
+				decrypted = sh.Data
+			} else {
+				if s.authEnabled {
+					if err := verifyAuthTagsWithState(s.sessionID, s.shardsByIndex, s.shardTags, s.totalShards, s.key, s.keyPayload, s.authTagSize); err != nil {
+						return nil, err
+					}
+				}
+				decrypted, err = decryptSessionPayloadWithKey(sh.Data, s.key, s.sessionID)
+				if err != nil {
+					return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+				}
+			}
+		} else {
+			combinedLen := 0
+			for i := 0; i < s.totalShards; i++ {
+				sh := s.shardsByIndex[i]
+				if sh == nil {
+					return nil, ErrReconstructionMissingShards(s.sessionID, len(s.shardsByIndex), s.totalShards, missingShardIndexes(s.shardsByIndex, s.totalShards))
+				}
+				combinedLen += len(sh.Data)
+			}
+			combined := make([]byte, combinedLen)
+			offset := 0
+			for i := 0; i < s.totalShards; i++ {
+				offset += copy(combined[offset:], s.shardsByIndex[i].Data)
+			}
+			if s.key.Mode == sessionCryptoModePerShard || s.key.Mode == sessionCryptoModePerShardStream {
+				decrypted = combined
+			} else {
+				if s.authEnabled {
+					if err := verifyAuthTagsWithState(s.sessionID, s.shardsByIndex, s.shardTags, s.totalShards, s.key, s.keyPayload, s.authTagSize); err != nil {
+						return nil, err
+					}
+				}
+				decrypted, err = decryptSessionPayloadWithKey(combined, s.key, s.sessionID)
+				if err != nil {
+					return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+				}
+			}
+		}
+	} else {
+		if s.authEnabled {
+			if err := verifyAuthTagsWithState(s.sessionID, s.shardsByIndex, s.shardTags, s.totalShards, s.key, s.keyPayload, s.authTagSize); err != nil {
+				return nil, err
+			}
+		}
+		unique := make([]*ces.Shard, 0, len(s.shardsByIndex))
+		for _, sh := range s.shardsByIndex {
+			if sh != nil {
+				unique = append(unique, sh)
+			}
+		}
+		encrypted, err := s.pipeline.Sharder().Reconstruct(unique)
+		if err != nil {
+			return nil, ErrShardingFailed(fmt.Sprintf("reconstruction failed for session %s missing_shard_ids=%v", s.sessionID, missingShardIndexes(s.shardsByIndex, s.totalShards))).WithCause(err)
+		}
+		decrypted, err = decryptSessionPayloadWithKey(encrypted, s.key, s.sessionID)
+		if err != nil {
+			return nil, ErrEncryptionFailed("session decrypt failed").WithCause(err)
+		}
+	}
+
+	data := decrypted
+	if s.useLengthPrefix {
+		data, err = stripLengthPrefix(data)
+		if err != nil {
+			return nil, ErrProtocolError("invalid length prefix").WithCause(err)
+		}
+	}
+	if s.pipeline != nil {
+		data, err = s.pipeline.Compressor().Decompress(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return data, nil
+}
+
+func cloneShardIndexMap(src map[int]*ces.Shard) map[int]*ces.Shard {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[int]*ces.Shard, len(src))
+	for idx, shard := range src {
+		dst[idx] = shard
+	}
+	return dst
+}
+
+func cloneAuthTagMap(src map[int][]byte) map[int][]byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[int][]byte, len(src))
+	for idx, tag := range src {
+		dst[idx] = tag
+	}
+	return dst
 }
 
 func hmacEqual(a, b []byte) bool {
@@ -1708,6 +1821,7 @@ func (h *DestinationHandler) unregisterSession(sessionID string) {
 	sessionID = baseSessionID(sessionID)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	delete(h.reconstructing, sessionID)
 	delete(h.keys, sessionID)
 	delete(h.keyData, sessionID)
 	delete(h.sessionDone, sessionID)
@@ -1861,6 +1975,9 @@ func (m *Mixnet) Close() error {
 		}
 		for sessionID := range m.destHandler.keyData {
 			delete(m.destHandler.keyData, sessionID)
+		}
+		for sessionID := range m.destHandler.reconstructing {
+			delete(m.destHandler.reconstructing, sessionID)
 		}
 		for sessionID := range m.destHandler.setupKeys {
 			delete(m.destHandler.setupKeys, sessionID)

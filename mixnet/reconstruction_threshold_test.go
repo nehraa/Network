@@ -2,6 +2,7 @@ package mixnet
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +138,125 @@ func TestDestinationHandlerReconstructsNonCESPerShardEncryption(t *testing.T) {
 	}
 }
 
+func TestDestinationHandlerTryReconstructConcurrentCallersShareResult(t *testing.T) {
+	t.Parallel()
+
+	pipeline := ces.NewPipeline(&ces.Config{
+		HopCount:         2,
+		CircuitCount:     4,
+		Compression:      "gzip",
+		ErasureThreshold: 2,
+	})
+
+	original := make([]byte, 1<<20)
+	for i := range original {
+		original[i] = byte(i)
+	}
+	compressed, err := pipeline.Compressor().Compress(original)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	encrypted, keyData, err := encryptSessionPayload(compressed)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	shards, err := pipeline.Sharder().Shard(encrypted)
+	if err != nil {
+		t.Fatalf("shard: %v", err)
+	}
+
+	handler := &DestinationHandler{
+		pipeline:       pipeline,
+		shardBuf:       make(map[string]map[int]*ces.Shard),
+		shardTags:      make(map[string]map[int][]byte),
+		totalShards:    make(map[string]int),
+		reconstructing: make(map[string]*reconstructionCall),
+		timers:         make(map[string]*time.Timer),
+		sessions:       make(map[string]*sessionMailbox),
+		sessionDone:    make(map[string]time.Time),
+		keys:           make(map[string]sessionKey),
+		keyData:        make(map[string][]byte),
+		inboundCh:      make(chan string, 1),
+		threshold:      2,
+		timeout:        5 * time.Second,
+		dataCh:         make(chan []byte, 1),
+		stopCh:         make(chan struct{}),
+	}
+
+	const sessionID = "concurrent-threshold-session"
+	for _, idx := range []int{0, 2} {
+		if err := handler.AddShard(sessionID, shards[idx], keyData, nil, len(shards)); err != nil {
+			t.Fatalf("add shard %d: %v", idx, err)
+		}
+	}
+
+	const callers = 8
+	results := make(chan []byte, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+
+	runCaller := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			data, err := handler.TryReconstruct(sessionID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- data
+		}()
+	}
+
+	runCaller()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		handler.mu.Lock()
+		_, inFlight := handler.reconstructing[sessionID]
+		handler.mu.Unlock()
+		if inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reconstruction did not enter in-flight state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	for i := 1; i < callers; i++ {
+		runCaller()
+	}
+
+	wg.Wait()
+	close(errs)
+	close(results)
+
+	for err := range errs {
+		t.Fatalf("TryReconstruct() error = %v", err)
+	}
+
+	count := 0
+	for data := range results {
+		if !bytes.Equal(data, original) {
+			t.Fatal("concurrent reconstruction payload mismatch")
+		}
+		count++
+	}
+	if count != callers {
+		t.Fatalf("concurrent reconstruction result count = %d, want %d", count, callers)
+	}
+
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if _, ok := handler.reconstructing[sessionID]; ok {
+		t.Fatal("reconstruction call leaked after completion")
+	}
+	if _, ok := handler.shardBuf[sessionID]; ok {
+		t.Fatal("completed session retained shard buffer")
+	}
+}
+
 func TestDestinationHandlerIgnoresLateShardAfterThreshold(t *testing.T) {
 	t.Parallel()
 
@@ -216,5 +336,67 @@ func TestDestinationHandlerIgnoresLateShardAfterThreshold(t *testing.T) {
 	}
 	if _, ok := handler.shardBuf[sessionID]; ok {
 		t.Fatal("late shard recreated shard buffer for completed session")
+	}
+}
+
+func BenchmarkDestinationHandlerTryReconstructCES(b *testing.B) {
+	pipeline := ces.NewPipeline(&ces.Config{
+		HopCount:         2,
+		CircuitCount:     4,
+		Compression:      "gzip",
+		ErasureThreshold: 2,
+	})
+
+	original := bytes.Repeat([]byte("mixnet-benchmark-reconstruct-"), 512)
+	compressed, err := pipeline.Compressor().Compress(original)
+	if err != nil {
+		b.Fatalf("compress: %v", err)
+	}
+	encrypted, keyData, err := encryptSessionPayload(compressed)
+	if err != nil {
+		b.Fatalf("encrypt: %v", err)
+	}
+	shards, err := pipeline.Sharder().Shard(encrypted)
+	if err != nil {
+		b.Fatalf("shard: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(original)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		handler := &DestinationHandler{
+			pipeline:       pipeline,
+			shardBuf:       make(map[string]map[int]*ces.Shard),
+			shardTags:      make(map[string]map[int][]byte),
+			totalShards:    make(map[string]int),
+			reconstructing: make(map[string]*reconstructionCall),
+			timers:         make(map[string]*time.Timer),
+			sessions:       make(map[string]*sessionMailbox),
+			sessionDone:    make(map[string]time.Time),
+			keys:           make(map[string]sessionKey),
+			keyData:        make(map[string][]byte),
+			inboundCh:      make(chan string, 1),
+			threshold:      2,
+			timeout:        5 * time.Second,
+			dataCh:         make(chan []byte, 1),
+			stopCh:         make(chan struct{}),
+		}
+
+		const sessionID = "bench-threshold-session"
+		if err := handler.AddShard(sessionID, shards[0], keyData, nil, len(shards)); err != nil {
+			b.Fatalf("add shard 0: %v", err)
+		}
+		if err := handler.AddShard(sessionID, shards[2], keyData, nil, len(shards)); err != nil {
+			b.Fatalf("add shard 2: %v", err)
+		}
+		reconstructed, err := handler.TryReconstruct(sessionID)
+		if err != nil {
+			b.Fatalf("TryReconstruct() error = %v", err)
+		}
+		if len(reconstructed) != len(original) {
+			b.Fatalf("len(reconstructed) = %d, want %d", len(reconstructed), len(original))
+		}
 	}
 }

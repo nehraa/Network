@@ -62,23 +62,40 @@ func sessionDataFrameVersion(mode sessionRouteMode) byte {
 }
 
 func encodeSessionSetupFramePayload(baseSessionID string, mode sessionRouteMode, encryptedHeader []byte, keyData []byte) ([]byte, error) {
-	if len(baseSessionID) > 0xff {
-		return nil, fmt.Errorf("base session id too long: %d", len(baseSessionID))
+	prefix, keyPrefix, err := buildSessionSetupFrameControlParts(baseSessionID, mode, len(encryptedHeader), len(keyData))
+	if err != nil {
+		return nil, err
 	}
-	buf := make([]byte, 1+len(baseSessionID)+1+4+len(encryptedHeader)+4+len(keyData))
+	buf := make([]byte, len(prefix)+len(encryptedHeader)+len(keyPrefix)+len(keyData))
+	copy(buf, prefix)
+	pos := len(prefix)
+	pos += copy(buf[pos:], encryptedHeader)
+	pos += copy(buf[pos:], keyPrefix)
+	copy(buf[pos:], keyData)
+	return buf, nil
+}
+
+func buildSessionSetupFrameControlParts(baseSessionID string, mode sessionRouteMode, encryptedHeaderLen int, keyDataLen int) ([]byte, []byte, error) {
+	if len(baseSessionID) > 0xff {
+		return nil, nil, fmt.Errorf("base session id too long: %d", len(baseSessionID))
+	}
+	if encryptedHeaderLen < 0 {
+		return nil, nil, fmt.Errorf("invalid encrypted header length: %d", encryptedHeaderLen)
+	}
+	if keyDataLen < 0 {
+		return nil, nil, fmt.Errorf("invalid key length: %d", keyDataLen)
+	}
+	buf := make([]byte, 1+len(baseSessionID)+1+4)
 	pos := 0
 	buf[pos] = byte(len(baseSessionID))
 	pos++
 	pos += copy(buf[pos:], baseSessionID)
 	buf[pos] = byte(mode)
 	pos++
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(encryptedHeader)))
-	pos += 4
-	pos += copy(buf[pos:], encryptedHeader)
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(keyData)))
-	pos += 4
-	copy(buf[pos:], keyData)
-	return buf, nil
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(encryptedHeaderLen))
+	keyPrefix := make([]byte, 4)
+	binary.LittleEndian.PutUint32(keyPrefix, uint32(keyDataLen))
+	return buf, keyPrefix, nil
 }
 
 func decodeSessionSetupFramePayload(data []byte) (string, sessionRouteMode, []byte, []byte, error) {
@@ -119,17 +136,33 @@ func decodeSessionSetupDeliveryPayload(data []byte) (string, []byte, error) {
 }
 
 func encodeSessionDataFramePayload(baseSessionID string, hasSeq bool, seq uint64, shard *ces.Shard, totalShards int, authTag []byte) ([]byte, error) {
+	if shard == nil {
+		return nil, fmt.Errorf("missing shard")
+	}
+	prefix, err := buildSessionDataFrameControlPrefix(baseSessionID, hasSeq, seq, shard.Index, totalShards, len(authTag))
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, len(prefix)+len(authTag)+len(shard.Data))
+	copy(buf, prefix)
+	pos := len(prefix)
+	pos += copy(buf[pos:], authTag)
+	copy(buf[pos:], shard.Data)
+	return buf, nil
+}
+
+func buildSessionDataFrameControlPrefix(baseSessionID string, hasSeq bool, seq uint64, shardIndex int, totalShards int, authTagLen int) ([]byte, error) {
 	if len(baseSessionID) > 0xff {
 		return nil, fmt.Errorf("base session id too long: %d", len(baseSessionID))
 	}
-	if shard == nil {
-		return nil, fmt.Errorf("missing shard")
+	if shardIndex < 0 {
+		return nil, fmt.Errorf("invalid shard index: %d", shardIndex)
 	}
 	if totalShards < 0 {
 		return nil, fmt.Errorf("invalid total shards: %d", totalShards)
 	}
-	if len(authTag) > 0xffff {
-		return nil, fmt.Errorf("auth tag too large: %d", len(authTag))
+	if authTagLen < 0 || authTagLen > 0xffff {
+		return nil, fmt.Errorf("auth tag too large: %d", authTagLen)
 	}
 	flags := byte(0)
 	seqLen := 0
@@ -137,7 +170,7 @@ func encodeSessionDataFramePayload(baseSessionID string, hasSeq bool, seq uint64
 		flags |= sessionDataFlagSequenced
 		seqLen = 8
 	}
-	buf := make([]byte, 1+len(baseSessionID)+1+seqLen+4+4+2+len(authTag)+len(shard.Data))
+	buf := make([]byte, 1+len(baseSessionID)+1+seqLen+4+4+2)
 	pos := 0
 	buf[pos] = byte(len(baseSessionID))
 	pos++
@@ -148,18 +181,31 @@ func encodeSessionDataFramePayload(baseSessionID string, hasSeq bool, seq uint64
 		binary.LittleEndian.PutUint64(buf[pos:], seq)
 		pos += 8
 	}
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(shard.Index))
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(shardIndex))
 	pos += 4
 	binary.LittleEndian.PutUint32(buf[pos:], uint32(totalShards))
 	pos += 4
-	binary.LittleEndian.PutUint16(buf[pos:], uint16(len(authTag)))
-	pos += 2
-	pos += copy(buf[pos:], authTag)
-	copy(buf[pos:], shard.Data)
+	binary.LittleEndian.PutUint16(buf[pos:], uint16(authTagLen))
 	return buf, nil
 }
 
 func decodeSessionDataFramePayload(data []byte) (string, bool, uint64, *ces.Shard, int, []byte, error) {
+	baseID, hasSeq, seq, shard, totalShards, authTag, err := decodeSessionDataFramePayloadView(data)
+	if err != nil {
+		return "", false, 0, nil, 0, nil, err
+	}
+	clonedShard := &ces.Shard{Index: shard.Index}
+	if len(shard.Data) > 0 {
+		clonedShard.Data = append([]byte(nil), shard.Data...)
+	}
+	var clonedAuthTag []byte
+	if len(authTag) > 0 {
+		clonedAuthTag = append([]byte(nil), authTag...)
+	}
+	return baseID, hasSeq, seq, clonedShard, totalShards, clonedAuthTag, nil
+}
+
+func decodeSessionDataFramePayloadView(data []byte) (string, bool, uint64, *ces.Shard, int, []byte, error) {
 	if len(data) < 1 {
 		return "", false, 0, nil, 0, nil, fmt.Errorf("session data payload too short")
 	}
@@ -190,9 +236,9 @@ func decodeSessionDataFramePayload(data []byte) (string, bool, uint64, *ces.Shar
 	if authLen < 0 || len(data) < offset+authLen {
 		return "", false, 0, nil, 0, nil, fmt.Errorf("invalid session data auth length")
 	}
-	authTag := append([]byte(nil), data[offset:offset+authLen]...)
+	authTag := data[offset : offset+authLen]
 	offset += authLen
-	shardData := append([]byte(nil), data[offset:]...)
+	shardData := data[offset:]
 	return baseID, hasSeq, seq, &ces.Shard{Index: shardIndex, Data: shardData}, totalShards, authTag, nil
 }
 

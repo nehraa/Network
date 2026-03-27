@@ -52,11 +52,12 @@ func buildHopPayload(isFinal byte, nextHop string, payload []byte) ([]byte, erro
 	if len(nextHop) > 65535 {
 		return nil, fmt.Errorf("next hop too long")
 	}
-	header := make([]byte, 1+2+len(nextHop))
-	header[0] = isFinal
-	binary.LittleEndian.PutUint16(header[1:3], uint16(len(nextHop)))
-	copy(header[3:], []byte(nextHop))
-	return append(header, payload...), nil
+	buf := make([]byte, 1+2+len(nextHop)+len(payload))
+	buf[0] = isFinal
+	binary.LittleEndian.PutUint16(buf[1:3], uint16(len(nextHop)))
+	copy(buf[3:], nextHop)
+	copy(buf[3+len(nextHop):], payload)
+	return buf, nil
 }
 
 func encryptHopPayload(key []byte, payload []byte) ([]byte, error) {
@@ -67,12 +68,13 @@ func encryptHopPayload(key []byte, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, aead.NonceSize())
+	nonceSize := aead.NonceSize()
+	out := make([]byte, nonceSize, nonceSize+len(payload)+aead.Overhead())
+	nonce := out[:nonceSize]
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, err
 	}
-	ciphertext := aead.Seal(nil, nonce, payload, nil)
-	return append(nonce, ciphertext...), nil
+	return aead.Seal(out, nonce, payload, nil), nil
 }
 
 func encodeEncryptedFrame(circuitID string, payload []byte) ([]byte, error) {
@@ -96,5 +98,8 @@ func encodeEncryptedFrameWithVersion(circuitID string, version byte, payload []b
 	if err != nil {
 		return nil, err
 	}
-	return append(header, payload...), nil
+	frame := make([]byte, len(header)+len(payload))
+	copy(frame, header)
+	copy(frame[len(header):], payload)
+	return frame, nil
 }
