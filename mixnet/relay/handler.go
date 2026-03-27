@@ -730,10 +730,11 @@ func (h *Handler) handleSessionDataFrameStream(ctx context.Context, reader *bufi
 	observe := h.observeFrame != nil
 	h.mu.RUnlock()
 
-	baseID, controlPrefix, dataPayloadLen, err := readSessionDataControlPrefix(reader, payloadLen, recordBandwidth)
+	baseID, controlPrefix, releaseControlPrefix, dataPayloadLen, err := readSessionDataControlPrefix(reader, payloadLen, recordBandwidth)
 	if err != nil {
 		return err
 	}
+	defer releaseControlPrefix()
 	route, ok := h.sessionRoute(sessionRoutes, baseID)
 	if !ok {
 		return fmt.Errorf("missing session route for %s", baseID)
@@ -1048,7 +1049,7 @@ func writeEncryptedFrameHeaderOnlyPayloadPrefix(ctx context.Context, w io.Writer
 	return total + n, err
 }
 
-func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBandwidth func(string, int64)) (string, []byte, int, error) {
+func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBandwidth func(string, int64)) (string, []byte, func(), int, error) {
 	readTracked := func(buf []byte) error {
 		if _, err := io.ReadFull(reader, buf); err != nil {
 			return err
@@ -1060,20 +1061,20 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	}
 
 	if payloadLen < 1 {
-		return "", nil, 0, fmt.Errorf("session data payload too short")
+		return "", nil, func() {}, 0, fmt.Errorf("session data payload too short")
 	}
 	var baseLenBuf [1]byte
 	if err := readTracked(baseLenBuf[:]); err != nil {
-		return "", nil, 0, err
+		return "", nil, func() {}, 0, err
 	}
 	baseLen := int(baseLenBuf[0])
 	if payloadLen < 1+baseLen+1+4+4+2 {
-		return "", nil, 0, fmt.Errorf("session data payload truncated")
+		return "", nil, func() {}, 0, fmt.Errorf("session data payload truncated")
 	}
 	baseAndFlags, releaseBaseAndFlags := borrowRelayScratch(baseLen + 1)
 	defer releaseBaseAndFlags()
 	if err := readTracked(baseAndFlags); err != nil {
-		return "", nil, 0, err
+		return "", nil, func() {}, 0, err
 	}
 	baseID := string(baseAndFlags[:baseLen])
 	flags := baseAndFlags[baseLen]
@@ -1081,20 +1082,20 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	var seqBuf [8]byte
 	if flags&sessionDataFlagSequenced != 0 {
 		if err := readTracked(seqBuf[:]); err != nil {
-			return "", nil, 0, err
+			return "", nil, func() {}, 0, err
 		}
 		prefixLen += len(seqBuf)
 	}
 	var metaBuf [10]byte
 	if err := readTracked(metaBuf[:]); err != nil {
-		return "", nil, 0, err
+		return "", nil, func() {}, 0, err
 	}
 	authLen := int(binary.LittleEndian.Uint16(metaBuf[8:10]))
 	prefixLen += len(metaBuf) + authLen
 	if payloadLen < prefixLen {
-		return "", nil, 0, fmt.Errorf("invalid session data auth length")
+		return "", nil, func() {}, 0, fmt.Errorf("invalid session data auth length")
 	}
-	prefix := make([]byte, prefixLen)
+	prefix, releasePrefix := borrowRelayScratch(prefixLen)
 	pos := copy(prefix, baseLenBuf[:])
 	pos += copy(prefix[pos:], baseAndFlags)
 	if flags&sessionDataFlagSequenced != 0 {
@@ -1103,14 +1104,16 @@ func readSessionDataControlPrefix(reader *bufio.Reader, payloadLen int, recordBa
 	pos += copy(prefix[pos:], metaBuf[:])
 	if authLen > 0 {
 		if err := readTracked(prefix[pos : pos+authLen]); err != nil {
-			return "", nil, 0, err
+			releasePrefix()
+			return "", nil, func() {}, 0, err
 		}
 	}
 	dataPayloadLen := payloadLen - prefixLen
 	if dataPayloadLen < 0 {
-		return "", nil, 0, fmt.Errorf("invalid session data payload length")
+		releasePrefix()
+		return "", nil, func() {}, 0, fmt.Errorf("invalid session data payload length")
 	}
-	return baseID, prefix, dataPayloadLen, nil
+	return baseID, prefix, releasePrefix, dataPayloadLen, nil
 }
 
 func (h *Handler) openStream(ctx context.Context, nextPeer peer.ID, protoID string) (network.Stream, error) {

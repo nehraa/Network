@@ -74,15 +74,19 @@ func BenchmarkReadSessionDataControlPrefix(b *testing.B) {
 	encoded.Write(auth)
 	encoded.Write(data)
 	frame := encoded.Bytes()
+	var raw bytes.Reader
+	reader := bufio.NewReaderSize(&raw, len(frame))
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(frame)))
 	for i := 0; i < b.N; i++ {
-		reader := bufio.NewReader(bytes.NewReader(frame))
-		baseID, prefix, dataLen, err := readSessionDataControlPrefix(reader, len(frame), nil)
+		raw.Reset(frame)
+		reader.Reset(&raw)
+		baseID, prefix, releasePrefix, dataLen, err := readSessionDataControlPrefix(reader, len(frame), nil)
 		if err != nil {
 			b.Fatalf("readSessionDataControlPrefix() error = %v", err)
 		}
+		releasePrefix()
 		if baseID == "" || len(prefix) == 0 || dataLen != len(data) {
 			b.Fatal("unexpected parsed control prefix result")
 		}

@@ -67,10 +67,11 @@ func TestReadSessionDataControlPrefix(t *testing.T) {
 	encoded.Write(data)
 
 	reader := bufio.NewReader(bytes.NewReader(encoded.Bytes()))
-	gotBaseID, prefix, gotDataLen, err := readSessionDataControlPrefix(reader, encoded.Len(), nil)
+	gotBaseID, prefix, releasePrefix, gotDataLen, err := readSessionDataControlPrefix(reader, encoded.Len(), nil)
 	if err != nil {
 		t.Fatalf("readSessionDataControlPrefix() error = %v", err)
 	}
+	defer releasePrefix()
 	if gotBaseID != baseID {
 		t.Fatalf("baseID = %q, want %q", gotBaseID, baseID)
 	}
