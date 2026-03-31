@@ -18,7 +18,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -33,7 +32,6 @@ import (
 	mixnet "github.com/libp2p/go-libp2p/mixnet/core"
 	"github.com/libp2p/go-libp2p/mixnet/relay"
 	"github.com/multiformats/go-multiaddr"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
@@ -62,7 +60,6 @@ const (
 	selectionModeRegionalMixnet mixnet.SelectionMode = "regional-mixnet"
 
 	directProtocol             protocol.ID = "/mixnet-bench/direct/1.0.0"
-	directKeyProtocol          protocol.ID = "/mixnet-bench/direct-key/1.0.0"
 	benchmarkChunkSize                     = 256 * 1024
 	benchmarkLargeChunkSize1MB             = 1 * 1024 * 1024
 	benchmarkLargeChunkSize2MB             = 2 * 1024 * 1024
@@ -811,15 +808,6 @@ func newCSEScenario(id, category, label, mode string, hops, circuits int) scenar
 	return sc
 }
 
-func newCompressedScenario(id, category, label, mode string, hops, circuits int) scenario {
-	sc := newMixnetScenario(id, category, label, mode, hops, circuits, false)
-	if mode == "direct" {
-		sc.Measurement = measurementDirect
-	}
-	sc.UseCompressionOnly = true
-	return sc
-}
-
 func executeScenario(opts suiteOptions, sc scenario, size int, runIdx int) (*runRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
@@ -1152,130 +1140,6 @@ func verifyMixnetPayload(stream *mixnet.MixStream, expected []byte) error {
 	return nil
 }
 
-type benchmarkSessionKeyStore struct {
-	mu      sync.Mutex
-	keyData []byte
-}
-
-func (s *benchmarkSessionKeyStore) Set(keyData []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.keyData = append(s.keyData[:0], keyData...)
-}
-
-func (s *benchmarkSessionKeyStore) Take() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data := append([]byte(nil), s.keyData...)
-	s.keyData = nil
-	return data
-}
-
-func installDirectSessionKeyHandler(h host.Host, store *benchmarkSessionKeyStore, errCh chan<- error) {
-	h.SetStreamHandler(directKeyProtocol, func(s network.Stream) {
-		defer s.Close()
-		data, err := io.ReadAll(s)
-		if err != nil {
-			reportAsyncError(errCh, err)
-			return
-		}
-		if _, err := mixnet.DecodeSessionKeyData(data); err != nil {
-			reportAsyncError(errCh, fmt.Errorf("decode exchanged session key: %w", err))
-			return
-		}
-		if store != nil {
-			store.Set(data)
-		}
-		if _, err := s.Write([]byte{1}); err != nil {
-			reportAsyncError(errCh, fmt.Errorf("ack session key exchange: %w", err))
-		}
-	})
-}
-
-func exchangeDirectSessionKey(ctx context.Context, h host.Host, dest peer.ID, keyData []byte) error {
-	s, err := h.NewStream(ctx, dest, directKeyProtocol)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	if err := writeAll(s, keyData); err != nil {
-		return err
-	}
-	if err := s.CloseWrite(); err != nil {
-		return err
-	}
-	ack := make([]byte, 1)
-	if _, err := io.ReadFull(s, ack); err != nil {
-		return err
-	}
-	if ack[0] != 1 {
-		return fmt.Errorf("invalid session key exchange ack")
-	}
-	return nil
-}
-
-func benchmarkSessionKeyData() ([]byte, error) {
-	_, keyData, err := mixnet.EncryptSessionPayload([]byte("benchmark-destination-session"))
-	return keyData, err
-}
-
-type benchmarkSessionMaterial struct {
-	nonce []byte
-	key   []byte
-}
-
-func benchmarkDirectSessionMaterial() ([]byte, benchmarkSessionMaterial, error) {
-	keyData, err := benchmarkSessionKeyData()
-	if err != nil {
-		return nil, benchmarkSessionMaterial{}, err
-	}
-	session, err := decodeBenchmarkSessionKeyData(keyData)
-	if err != nil {
-		return nil, benchmarkSessionMaterial{}, err
-	}
-	return keyData, session, nil
-}
-
-func decodeBenchmarkSessionKeyData(data []byte) (benchmarkSessionMaterial, error) {
-	const (
-		nonceSize = 24
-		keySize   = 32
-	)
-	if len(data) != nonceSize+keySize {
-		return benchmarkSessionMaterial{}, fmt.Errorf("invalid key data length")
-	}
-	return benchmarkSessionMaterial{
-		nonce: append([]byte(nil), data[:nonceSize]...),
-		key:   append([]byte(nil), data[nonceSize:]...),
-	}, nil
-}
-
-func deriveChunkNonce(base []byte, chunkIndex uint64) []byte {
-	nonce := append([]byte(nil), base...)
-	if len(nonce) >= 8 {
-		start := len(nonce) - 8
-		cur := binary.LittleEndian.Uint64(nonce[start:])
-		binary.LittleEndian.PutUint64(nonce[start:], cur+chunkIndex)
-	}
-	return nonce
-}
-
-func encryptDirectChunk(session benchmarkSessionMaterial, chunkIndex uint64, plaintext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(session.key)
-	if err != nil {
-		return nil, err
-	}
-	return aead.Seal(nil, deriveChunkNonce(session.nonce, chunkIndex), plaintext, nil), nil
-}
-
-func decryptDirectChunk(session benchmarkSessionMaterial, chunkIndex uint64, ciphertext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(session.key)
-	if err != nil {
-		return nil, err
-	}
-	return aead.Open(nil, deriveChunkNonce(session.nonce, chunkIndex), ciphertext, nil)
-}
-
 func writeAll(w io.Writer, payload []byte) error {
 	for len(payload) > 0 {
 		n, err := w.Write(payload)
@@ -1368,90 +1232,6 @@ func verifyDirectSessionPayload(r io.Reader, expected []byte) error {
 			return err
 		}
 		plaintext, err := mixnet.DecryptSessionPayload(ciphertext, session)
-		if err != nil {
-			return err
-		}
-		end := received + len(plaintext)
-		if end > len(expected) {
-			return fmt.Errorf("direct payload overflow: got=%d want=%d", end, len(expected))
-		}
-		if !bytes.Equal(plaintext, expected[received:end]) {
-			return fmt.Errorf("direct payload mismatch at offset=%d", received)
-		}
-		received = end
-	}
-	return nil
-}
-
-func readDirectPayload(r io.Reader, expectedLen int) ([]byte, error) {
-	out := make([]byte, 0, expectedLen)
-	for len(out) < expectedLen {
-		payload, err := readDirectFrame(r)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, payload...)
-	}
-	if len(out) > expectedLen {
-		out = out[:expectedLen]
-	}
-	return out, nil
-}
-
-func verifyDirectPayload(r io.Reader, expected []byte) error {
-	received := 0
-	for received < len(expected) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			return err
-		}
-		payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
-		if payloadLen < 0 {
-			return fmt.Errorf("invalid direct frame length")
-		}
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return err
-		}
-		end := received + len(payload)
-		if end > len(expected) {
-			return fmt.Errorf("direct payload overflow: got=%d want=%d", end, len(expected))
-		}
-		if !bytes.Equal(payload, expected[received:end]) {
-			return fmt.Errorf("direct payload mismatch at offset=%d", received)
-		}
-		received = end
-	}
-	return nil
-}
-
-func readDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, expectedLen int) ([]byte, error) {
-	out := make([]byte, 0, expectedLen)
-	for chunkIndex := uint64(0); len(out) < expectedLen; chunkIndex++ {
-		payload, err := readDirectFrame(r)
-		if err != nil {
-			return nil, err
-		}
-		plaintext, err := decryptDirectChunk(session, chunkIndex, payload)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, plaintext...)
-	}
-	if len(out) > expectedLen {
-		out = out[:expectedLen]
-	}
-	return out, nil
-}
-
-func verifyDirectEncryptedChunks(r io.Reader, session benchmarkSessionMaterial, expected []byte) error {
-	received := 0
-	for chunkIndex := uint64(0); received < len(expected); chunkIndex++ {
-		payload, err := readDirectFrame(r)
-		if err != nil {
-			return err
-		}
-		plaintext, err := decryptDirectChunk(session, chunkIndex, payload)
 		if err != nil {
 			return err
 		}
@@ -2574,7 +2354,10 @@ func modeLabel(mode string) string {
 	case "full":
 		return "Full onion"
 	default:
-		return strings.Title(mode)
+		if mode == "" {
+			return ""
+		}
+		return strings.ToUpper(mode[:1]) + mode[1:]
 	}
 }
 

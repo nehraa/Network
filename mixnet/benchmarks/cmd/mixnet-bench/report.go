@@ -17,12 +17,6 @@ type chartSeries struct {
 	Value  func(summaryRecord) float64
 }
 
-type relativeSeriesSpec struct {
-	Name       string
-	Color      string
-	ScenarioID string
-}
-
 type reportData struct {
 	Profile     string
 	Network     string
@@ -233,23 +227,6 @@ func writeReport(outputDir string, opts suiteOptions, runRecords []*runRecord, s
 	return tmpl.Execute(file, data)
 }
 
-func series(items ...any) []chartSeries {
-	out := make([]chartSeries, 0, len(items)/4)
-	for i := 0; i < len(items); i += 4 {
-		name := items[i].(string)
-		color := items[i+1].(string)
-		lookup := items[i+2].(map[string][]summaryRecord)
-		id := items[i+3].(string)
-		points := append([]summaryRecord(nil), lookup[id]...)
-		sort.Slice(points, func(i, j int) bool { return points[i].SizeBytes < points[j].SizeBytes })
-		if len(points) == 0 {
-			continue
-		}
-		out = append(out, chartSeries{Name: name, Color: color, Points: points})
-	}
-	return out
-}
-
 func hasChartData(items []chartSeries) bool {
 	for _, item := range items {
 		if len(item.Points) > 0 {
@@ -281,176 +258,12 @@ func summaryMapBySize(points []summaryRecord) map[int]summaryRecord {
 	return out
 }
 
-func cesAdjustmentBySize(lookup map[string][]summaryRecord, localID, cesLocalID string) map[int]float64 {
-	localBySize := summaryMapBySize(sortedPointsByID(lookup, localID))
-	cesLocalBySize := summaryMapBySize(sortedPointsByID(lookup, cesLocalID))
-	out := make(map[int]float64, len(cesLocalBySize))
-	for size, cesLocal := range cesLocalBySize {
-		local, ok := localBySize[size]
-		if !ok {
-			continue
-		}
-		out[size] = cesLocal.TotalMeanMS - local.TotalMeanMS
-	}
-	return out
-}
-
-func adjustedSummaryPoints(lookup map[string][]summaryRecord, scenarioID, localID, cesLocalID string) []summaryRecord {
-	points := sortedPointsByID(lookup, scenarioID)
-	if len(points) == 0 {
-		return nil
-	}
-	adjustmentBySize := cesAdjustmentBySize(lookup, localID, cesLocalID)
-	out := make([]summaryRecord, 0, len(points))
-	for _, point := range points {
-		adjustment, ok := adjustmentBySize[point.SizeBytes]
-		if !ok {
-			continue
-		}
-		adjusted := point
-		adjusted.TotalMeanMS = point.TotalMeanMS - adjustment
-		if adjusted.TotalMeanMS < 0 {
-			adjusted.TotalMeanMS = 0
-		}
-		if adjusted.HopCount > 0 {
-			adjusted.PerHopMeanMS = adjusted.TotalMeanMS / float64(adjusted.HopCount)
-		}
-		adjusted.Label = point.Label + " (net CES local)"
-		out = append(out, adjusted)
-	}
-	return out
-}
-
-func localDeltaPoints(lookup map[string][]summaryRecord, localID, cesLocalID string) []summaryRecord {
-	localBySize := summaryMapBySize(sortedPointsByID(lookup, localID))
-	cesLocalPoints := sortedPointsByID(lookup, cesLocalID)
-	out := make([]summaryRecord, 0, len(cesLocalPoints))
-	for _, point := range cesLocalPoints {
-		local, ok := localBySize[point.SizeBytes]
-		if !ok {
-			continue
-		}
-		delta := point
-		delta.TotalMeanMS = point.TotalMeanMS - local.TotalMeanMS
-		delta.Label = point.Label + " delta"
-		out = append(out, delta)
-	}
-	return out
-}
-
 func rawChartSeries(name, color string, lookup map[string][]summaryRecord, scenarioID string) chartSeries {
 	return chartSeries{
 		Name:   name,
 		Color:  color,
 		Points: sortedPointsByID(lookup, scenarioID),
 	}
-}
-
-func adjustedChartSeries(name, color string, lookup map[string][]summaryRecord, scenarioID, localID, cesLocalID string) chartSeries {
-	return chartSeries{
-		Name:   name,
-		Color:  color,
-		Points: adjustedSummaryPoints(lookup, scenarioID, localID, cesLocalID),
-	}
-}
-
-func relativeSeries(lookup map[string][]summaryRecord, baselineID string, specs ...relativeSeriesSpec) []chartSeries {
-	baselineBySize := make(map[int]float64)
-	for _, point := range lookup[baselineID] {
-		baselineBySize[point.SizeBytes] = point.TotalMeanMS
-	}
-
-	out := make([]chartSeries, 0, len(specs))
-	for _, spec := range specs {
-		points := append([]summaryRecord(nil), lookup[spec.ScenarioID]...)
-		sort.Slice(points, func(i, j int) bool { return points[i].SizeBytes < points[j].SizeBytes })
-		if len(points) == 0 {
-			continue
-		}
-		out = append(out, chartSeries{
-			Name:   spec.Name,
-			Color:  spec.Color,
-			Points: points,
-			Value: func(summary summaryRecord) float64 {
-				baseline := baselineBySize[summary.SizeBytes]
-				if baseline <= 0 {
-					return 0
-				}
-				return ((summary.TotalMeanMS - baseline) / baseline) * 100.0
-			},
-		})
-	}
-	return out
-}
-
-func relativeToScenarioSeries(name, color string, lookup map[string][]summaryRecord, scenarioID, baselineScenarioID string) chartSeries {
-	baselineBySize := make(map[int]float64)
-	for _, point := range lookup[baselineScenarioID] {
-		baselineBySize[point.SizeBytes] = point.TotalMeanMS
-	}
-	return chartSeries{
-		Name:   name,
-		Color:  color,
-		Points: sortedPointsByID(lookup, scenarioID),
-		Value: func(summary summaryRecord) float64 {
-			baseline := baselineBySize[summary.SizeBytes]
-			if baseline <= 0 {
-				return 0
-			}
-			return percentDelta(summary.TotalMeanMS, baseline)
-		},
-	}
-}
-
-func relativeSeriesFromPoints(baselineBySize map[int]float64, items ...chartSeries) []chartSeries {
-	out := make([]chartSeries, 0, len(items))
-	for _, item := range items {
-		if len(item.Points) == 0 {
-			continue
-		}
-		points := append([]summaryRecord(nil), item.Points...)
-		sort.Slice(points, func(i, j int) bool { return points[i].SizeBytes < points[j].SizeBytes })
-		out = append(out, chartSeries{
-			Name:   item.Name,
-			Color:  item.Color,
-			Points: points,
-			Value: func(summary summaryRecord) float64 {
-				baseline := baselineBySize[summary.SizeBytes]
-				if baseline <= 0 {
-					return 0
-				}
-				return percentDelta(summary.TotalMeanMS, baseline)
-			},
-		})
-	}
-	return out
-}
-
-func filteredSeriesByCategory(summaries []summaryRecord, category string, colors []string, value func(summaryRecord) float64) []chartSeries {
-	grouped := make(map[string][]summaryRecord)
-	for _, summary := range summaries {
-		if summary.Category != category {
-			continue
-		}
-		grouped[summary.Label] = append(grouped[summary.Label], summary)
-	}
-	names := make([]string, 0, len(grouped))
-	for name := range grouped {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out := make([]chartSeries, 0, len(names))
-	for i, name := range names {
-		points := grouped[name]
-		sort.Slice(points, func(i, j int) bool { return points[i].SizeBytes < points[j].SizeBytes })
-		out = append(out, chartSeries{
-			Name:   name,
-			Color:  colors[i%len(colors)],
-			Points: points,
-			Value:  value,
-		})
-	}
-	return out
 }
 
 func compactSummaries(summaries []summaryRecord) []summaryRecord {
@@ -831,13 +644,6 @@ func percentDelta(value, baseline float64) float64 {
 		return 0
 	}
 	return ((value - baseline) / baseline) * 100.0
-}
-
-func percentOf(value, baseline float64) float64 {
-	if baseline == 0 {
-		return 0
-	}
-	return (value / baseline) * 100.0
 }
 
 func writeSVGLineChart(path, title, yLabel string, chartData []chartSeries, value func(summaryRecord) float64) error {
