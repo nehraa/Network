@@ -3,6 +3,9 @@ package mixnet
 
 import (
 	"context"
+	crand "crypto/rand"
+	"errors"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -82,9 +85,15 @@ func DefaultCoverTrafficConfig() *CoverTrafficConfig {
 
 // CoverTrafficGenerator generates cover traffic to prevent timing analysis.
 type CoverTrafficGenerator struct {
-	config *CoverTrafficConfig
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	config       *CoverTrafficConfig
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	wg           sync.WaitGroup
+	senderMu     sync.RWMutex
+	sender       func(context.Context, peer.ID, []byte) error
+	errorHandler func(error)
+	rngMu        sync.Mutex
+	rng          *rand.Rand
 }
 
 // NewCoverTrafficGenerator creates a new cover traffic generator.
@@ -95,10 +104,25 @@ func NewCoverTrafficGenerator(cfg *CoverTrafficConfig) *CoverTrafficGenerator {
 	return &CoverTrafficGenerator{
 		config: cfg,
 		stopCh: make(chan struct{}),
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
-// Start begins generating cover traffic to random peers.
+// SetSender wires the transport hook used to emit cover traffic packets.
+func (ctg *CoverTrafficGenerator) SetSender(sender func(context.Context, peer.ID, []byte) error) {
+	ctg.senderMu.Lock()
+	defer ctg.senderMu.Unlock()
+	ctg.sender = sender
+}
+
+// SetErrorHandler receives asynchronous delivery errors from the background loop.
+func (ctg *CoverTrafficGenerator) SetErrorHandler(fn func(error)) {
+	ctg.senderMu.Lock()
+	defer ctg.senderMu.Unlock()
+	ctg.errorHandler = fn
+}
+
+// Start begins generating cover traffic to the discovered peer set.
 func (ctg *CoverTrafficGenerator) Start(ctx context.Context, getPeers func() []peer.ID) {
 	if !ctg.config.Enabled {
 		return
@@ -108,19 +132,22 @@ func (ctg *CoverTrafficGenerator) Start(ctx context.Context, getPeers func() []p
 	go func() {
 		defer ctg.wg.Done()
 
-		ticker := time.NewTicker(ctg.config.Interval)
-		defer ticker.Stop()
-
 		for {
+			wait := ctg.nextInterval()
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			case <-ctg.stopCh:
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				peers := getPeers()
 				if len(peers) > 0 {
-					_ = ctg.sendCoverTraffic(peers)
+					if err := ctg.sendCoverTraffic(ctx, peers); err != nil {
+						ctg.handleError(err)
+					}
 				}
 			}
 		}
@@ -129,16 +156,78 @@ func (ctg *CoverTrafficGenerator) Start(ctx context.Context, getPeers func() []p
 
 // Stop stops cover traffic generation.
 func (ctg *CoverTrafficGenerator) Stop() {
-	close(ctg.stopCh)
+	ctg.stopOnce.Do(func() {
+		close(ctg.stopCh)
+	})
 	ctg.wg.Wait()
 }
 
-// sendCoverTraffic sends dummy traffic for cover.
-func (ctg *CoverTrafficGenerator) sendCoverTraffic(peers []peer.ID) error {
-	dummy := make([]byte, ctg.config.PacketSize)
-	for i := range dummy {
-		dummy[i] = byte(i % 256)
+func (ctg *CoverTrafficGenerator) nextInterval() time.Duration {
+	interval := ctg.config.Interval
+	if interval <= 0 {
+		interval = time.Second
 	}
-	_ = peers
-	return nil
+	if ctg.config.Jitter <= 0 {
+		return interval
+	}
+	jitterWindow := int64(ctg.config.Jitter)*2 + 1
+	delta := time.Duration(ctg.randomInt63n(jitterWindow)) - ctg.config.Jitter
+	if interval+delta < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval + delta
+}
+
+func (ctg *CoverTrafficGenerator) handleError(err error) {
+	if err == nil {
+		return
+	}
+	ctg.senderMu.RLock()
+	handler := ctg.errorHandler
+	ctg.senderMu.RUnlock()
+	if handler != nil {
+		handler(err)
+	}
+}
+
+// sendCoverTraffic emits one cover packet to a randomly selected peer.
+func (ctg *CoverTrafficGenerator) sendCoverTraffic(ctx context.Context, peers []peer.ID) error {
+	if len(peers) == 0 {
+		return nil
+	}
+	if ctg.config.PacketSize <= 0 {
+		return errors.New("cover traffic packet size must be positive")
+	}
+
+	ctg.senderMu.RLock()
+	sender := ctg.sender
+	ctg.senderMu.RUnlock()
+	if sender == nil {
+		return errors.New("cover traffic sender is not configured")
+	}
+
+	payload := make([]byte, ctg.config.PacketSize)
+	if _, err := crand.Read(payload); err != nil {
+		return err
+	}
+	target := peers[ctg.randomIntn(len(peers))]
+	return sender(ctx, target, payload)
+}
+
+func (ctg *CoverTrafficGenerator) randomIntn(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	ctg.rngMu.Lock()
+	defer ctg.rngMu.Unlock()
+	return ctg.rng.Intn(n)
+}
+
+func (ctg *CoverTrafficGenerator) randomInt63n(n int64) int64 {
+	if n <= 1 {
+		return 0
+	}
+	ctg.rngMu.Lock()
+	defer ctg.rngMu.Unlock()
+	return ctg.rng.Int63n(n)
 }
