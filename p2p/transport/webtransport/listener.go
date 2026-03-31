@@ -31,7 +31,7 @@ type listener struct {
 	isStaticTLSConf bool
 	reuseListener   quicreuse.Listener
 
-	server webtransport.Server
+	server *webtransport.Server
 
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -63,7 +63,7 @@ func newListener(reuseListener quicreuse.Listener, t *transport, isStaticTLSConf
 		serverClosed:    make(chan struct{}),
 		addr:            reuseListener.Addr(),
 		multiaddr:       localMultiaddr,
-		server: webtransport.Server{
+		server: &webtransport.Server{
 			H3: &http3.Server{
 				ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
 					return context.WithValue(ctx, connKey{}, c)
