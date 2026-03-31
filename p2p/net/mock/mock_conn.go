@@ -100,9 +100,10 @@ func (c *conn) teardown() {
 
 func (c *conn) addStream(s *stream) {
 	c.Lock()
-	defer c.Unlock()
 	s.conn = c
 	c.streams.PushBack(s)
+	c.Unlock()
+	s.startTransport()
 }
 
 func (c *conn) removeStream(s *stream) {

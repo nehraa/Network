@@ -28,10 +28,16 @@ type stream struct {
 	close  chan struct{}
 	closed chan struct{}
 
-	writeErr error
+	writeErr         error
+	readErr          atomic.Pointer[streamErrorState]
+	writeErrOverride atomic.Pointer[streamErrorState]
 
 	protocol atomic.Pointer[protocol.ID]
 	stat     network.Stats
+}
+
+type streamErrorState struct {
+	err error
 }
 
 var ErrClosed = errors.New("stream closed")
@@ -63,13 +69,15 @@ func newStream(w *io.PipeWriter, r *io.PipeReader, dir network.Direction) *strea
 		toDeliver: make(chan *transportObject),
 		stat:      network.Stats{Direction: dir},
 	}
-
-	go s.transport()
 	return s
 }
 
 // How to handle errors with writes?
 func (s *stream) Write(p []byte) (n int, err error) {
+	if err := s.currentWriteErr(); err != nil {
+		return 0, err
+	}
+
 	l := s.conn.link
 	delay := l.GetLatency() + l.RateLimit(len(p))
 	t := time.Now().Add(delay)
@@ -108,6 +116,7 @@ func (s *stream) SetProtocol(proto protocol.ID) error {
 }
 
 func (s *stream) CloseWrite() error {
+	s.setWriteErrOverride(ErrClosed)
 	select {
 	case s.close <- struct{}{}:
 	default:
@@ -120,6 +129,7 @@ func (s *stream) CloseWrite() error {
 }
 
 func (s *stream) CloseRead() error {
+	s.setReadErr(ErrClosed)
 	return s.read.CloseWithError(ErrClosed)
 }
 
@@ -138,6 +148,17 @@ func (s *stream) ResetWithError(errCode network.StreamErrorCode) error {
 	localErr := streamResetError(errCode, false)
 	remoteErr := streamResetError(errCode, true)
 
+	s.setReadErr(localErr)
+	s.setWriteErrOverride(localErr)
+	if s.rstream != nil {
+		s.rstream.setReadErr(remoteErr)
+		s.rstream.setWriteErrOverride(remoteErr)
+		select {
+		case s.rstream.reset <- remoteErr:
+		default:
+		}
+	}
+
 	// Cancel any pending reads/writes with an error.
 	s.write.CloseWithError(remoteErr)
 	s.read.CloseWithError(remoteErr)
@@ -147,6 +168,9 @@ func (s *stream) ResetWithError(errCode network.StreamErrorCode) error {
 	default:
 	}
 	<-s.closed
+	if s.writeErr == nil {
+		s.writeErr = localErr
+	}
 
 	// No meaningful error case here.
 	return nil
@@ -154,7 +178,9 @@ func (s *stream) ResetWithError(errCode network.StreamErrorCode) error {
 
 func (s *stream) teardown() {
 	// at this point, no streams are writing.
-	s.conn.removeStream(s)
+	if s.conn != nil {
+		s.conn.removeStream(s)
+	}
 
 	// Mark as closed.
 	close(s.closed)
@@ -172,7 +198,15 @@ func (s *stream) SetReadDeadline(_ time.Time) error  { return nil }
 func (s *stream) SetWriteDeadline(_ time.Time) error { return nil }
 
 func (s *stream) Read(b []byte) (int, error) {
+	if err := s.currentReadErr(); err != nil {
+		return 0, err
+	}
+
 	return s.read.Read(b)
+}
+
+func (s *stream) startTransport() {
+	go s.transport()
 }
 
 // transport will grab message arrival times, wait until that time, and
@@ -298,6 +332,30 @@ func (s *stream) Scope() network.StreamScope {
 func (s *stream) cancelWrite(err error) {
 	s.write.CloseWithError(err)
 	s.writeErr = err
+}
+
+func (s *stream) setReadErr(err error) {
+	s.readErr.Store(&streamErrorState{err: err})
+}
+
+func (s *stream) currentReadErr() error {
+	state := s.readErr.Load()
+	if state == nil {
+		return nil
+	}
+	return state.err
+}
+
+func (s *stream) setWriteErrOverride(err error) {
+	s.writeErrOverride.Store(&streamErrorState{err: err})
+}
+
+func (s *stream) currentWriteErr() error {
+	state := s.writeErrOverride.Load()
+	if state == nil {
+		return nil
+	}
+	return state.err
 }
 
 func streamResetError(code network.StreamErrorCode, remote bool) error {

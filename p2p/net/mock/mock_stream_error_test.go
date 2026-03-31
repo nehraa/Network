@@ -1,7 +1,6 @@
 package mocknet
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -10,31 +9,23 @@ import (
 )
 
 func TestResetWithErrorPropagatesStreamErrorCodes(t *testing.T) {
-	mn, err := FullMeshConnected(2)
-	require.NoError(t, err)
-	defer mn.Close()
-
-	hosts := mn.Hosts()
-	clientNet := hosts[0].Network()
-	serverNet := hosts[1].Network()
-
-	remoteStreamCh := make(chan network.Stream, 1)
-	serverNet.SetStreamHandler(func(s network.Stream) {
-		remoteStreamCh <- s
-	})
-
-	localStream, err := clientNet.NewStream(context.Background(), hosts[1].ID())
+	localStream, remoteStream := newConnectedStreamPair()
+	err := localStream.ResetWithError(42)
 	require.NoError(t, err)
 
-	remoteStream := <-remoteStreamCh
-	err = localStream.ResetWithError(42)
-	require.NoError(t, err)
+	assertStreamResetError(t, localStream, 42, false)
+	assertStreamResetError(t, remoteStream, 42, true)
+}
 
-	_, err = localStream.Write([]byte("x"))
-	requireStreamResetError(t, err, 42, false)
+func newConnectedStreamPair() (*stream, *stream) {
+	l := newLink(nil, LinkOptions{})
+	localConn := &conn{link: l}
+	remoteConn := &conn{link: l}
 
-	_, err = remoteStream.Read(make([]byte, 1))
-	requireStreamResetError(t, err, 42, true)
+	localStream, remoteStream := newStreamPair()
+	localConn.addStream(localStream)
+	remoteConn.addStream(remoteStream)
+	return localStream, remoteStream
 }
 
 func requireStreamResetError(t *testing.T, err error, code network.StreamErrorCode, remote bool) {
@@ -47,4 +38,14 @@ func requireStreamResetError(t *testing.T, err error, code network.StreamErrorCo
 	require.True(t, errors.As(err, &streamErr))
 	require.Equal(t, code, streamErr.ErrorCode)
 	require.Equal(t, remote, streamErr.Remote)
+}
+
+func assertStreamResetError(t *testing.T, s network.Stream, code network.StreamErrorCode, remote bool) {
+	t.Helper()
+
+	_, err := s.Read(make([]byte, 1))
+	requireStreamResetError(t, err, code, remote)
+
+	_, err = s.Write([]byte("x"))
+	requireStreamResetError(t, err, code, remote)
 }
