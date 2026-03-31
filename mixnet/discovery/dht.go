@@ -100,13 +100,49 @@ func NewRelayDiscoveryWithHost(h host.Host, protocolID string, samplingSize int,
 	}
 }
 
-// SelectRelays chooses a set of relays from the provided candidates based on the selection mode.
+// SelectRelays chooses a concrete subset of relays from already-discovered
+// candidates using the configured selection strategy.
 func (r *RelayDiscovery) SelectRelays(ctx context.Context, candidates []RelayInfo) ([]RelayInfo, error) {
-	// For now, simple RTT selection
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Latency < candidates[j].Latency
-	})
-	return candidates, nil
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("insufficient relay peers: have 0, need 1")
+	}
+
+	count := r.samplingSize
+	if count <= 0 || count > len(candidates) {
+		count = len(candidates)
+	}
+
+	sorted := sortedRelayCandidates(candidates)
+	if len(sorted) < count {
+		return nil, fmt.Errorf("could not select enough relays: have %d, need %d", len(sorted), count)
+	}
+
+	switch normalizeSelectionMode(r.selectionMode) {
+	case selectionModeRandom:
+		return r.randomRelaySample(sorted, count), nil
+	case selectionModeHybrid:
+		window := minInt(len(sorted), maxInt(count, r.samplingSize))
+		if window < count {
+			window = count
+		}
+		return r.randomRelaySample(sorted[:window], count), nil
+	case selectionModeLOR:
+		window := minInt(len(sorted), maxInt(count+1, count*2))
+		pool := append([]RelayInfo(nil), sorted[:window]...)
+		if len(pool) > count {
+			drop := r.randomIntn(len(pool))
+			pool = append(pool[:drop], pool[drop+1:]...)
+		}
+		return takeUniqueRelays(pool, count)
+	case selectionModeSingleCircle:
+		return takeUniqueRelays(sorted, count)
+	case selectionModeMultipleCircle:
+		return selectCircuitLayout(buildLatencyCircles(sorted, 3), sorted, 1, count, false)
+	case selectionModeRegionalMixnet:
+		return selectRegionalLayout(sorted, 1, count)
+	default:
+		return takeUniqueRelays(sorted, count)
+	}
 }
 
 // FindRelays discovers potential relay nodes and selects them based on selection mode.
@@ -299,6 +335,60 @@ func takeUniqueRelays(relays []RelayInfo, count int) ([]RelayInfo, error) {
 		}
 	}
 	return nil, fmt.Errorf("could not select enough relays: have %d, need %d", len(result), count)
+}
+
+func sortedRelayCandidates(candidates []RelayInfo) []RelayInfo {
+	normalized := make([]RelayInfo, 0, len(candidates))
+	seen := make(map[peer.ID]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.PeerID == "" {
+			candidate.PeerID = candidate.AddrInfo.ID
+		}
+		if candidate.PeerID == "" {
+			continue
+		}
+		if candidate.AddrInfo.ID == "" {
+			candidate.AddrInfo.ID = candidate.PeerID
+		}
+		if candidate.Latency <= 0 {
+			candidate.Latency = defaultLatency
+		}
+		if _, ok := seen[candidate.PeerID]; ok {
+			continue
+		}
+		seen[candidate.PeerID] = struct{}{}
+		normalized = append(normalized, candidate)
+	}
+
+	sort.SliceStable(normalized, func(i, j int) bool {
+		if normalized[i].Available != normalized[j].Available {
+			return normalized[i].Available
+		}
+		if normalized[i].Latency == normalized[j].Latency {
+			return normalized[i].PeerID.String() < normalized[j].PeerID.String()
+		}
+		return normalized[i].Latency < normalized[j].Latency
+	})
+	return normalized
+}
+
+func (r *RelayDiscovery) randomRelaySample(candidates []RelayInfo, count int) []RelayInfo {
+	if count >= len(candidates) {
+		out := make([]RelayInfo, len(candidates))
+		copy(out, candidates)
+		return out
+	}
+	shuffled := make([]RelayInfo, len(candidates))
+	copy(shuffled, candidates)
+	r.rngMu.Lock()
+	defer r.rngMu.Unlock()
+	if r.rng == nil {
+		r.rng = newRand()
+	}
+	r.rng.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	return shuffled[:count]
 }
 
 func buildLatencyCircles(sorted []RelayInfo, circleCount int) [][]RelayInfo {

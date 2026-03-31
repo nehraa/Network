@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -74,6 +75,40 @@ func TestSelectRegionalLayoutPrefersRemoteExit(t *testing.T) {
 		if exit.Latency < 50*time.Millisecond {
 			t.Fatalf("expected remote exits to come from slower half, got %v", latenciesOf(exits))
 		}
+	}
+	assertUniqueRelays(t, selected)
+}
+
+func TestSelectRelaysUsesSamplingSizeForRTTMode(t *testing.T) {
+	t.Parallel()
+
+	rd := NewRelayDiscovery("mixnet", 3, selectionModeRTT, 0.3)
+	selected, err := rd.SelectRelays(context.Background(), testRelays(6))
+	if err != nil {
+		t.Fatalf("SelectRelays() error = %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("selected len = %d, want 3", len(selected))
+	}
+	if got := latenciesOf(selected); got[0] != 10*time.Millisecond || got[1] != 20*time.Millisecond || got[2] != 30*time.Millisecond {
+		t.Fatalf("RTT selection should keep the three fastest relays, got %v", got)
+	}
+	assertUniqueRelays(t, selected)
+}
+
+func TestSelectRelaysMultipleCircleSpreadsAcrossLatencyBands(t *testing.T) {
+	t.Parallel()
+
+	rd := NewRelayDiscovery("mixnet", 3, selectionModeMultipleCircle, 0.3)
+	selected, err := rd.SelectRelays(context.Background(), testRelays(6))
+	if err != nil {
+		t.Fatalf("SelectRelays() error = %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("selected len = %d, want 3", len(selected))
+	}
+	if got := latenciesOf(selected); got[0] != 10*time.Millisecond || got[1] != 30*time.Millisecond || got[2] != 50*time.Millisecond {
+		t.Fatalf("multiple-circle selection should spread picks across circles, got %v", got)
 	}
 	assertUniqueRelays(t, selected)
 }
