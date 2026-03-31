@@ -27,19 +27,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Vet hub package
-        run: go vet ./p2p/hub/...
-
-      - name: Run repeated hub tests
-        run: go test -shuffle=on -count=10 ./p2p/hub/...
-
-      - name: Run hub race tests
-        run: go test -race ./p2p/hub/...
-
-      - name: Enforce hub coverage floor
-        run: |
-          go test -count=1 -coverprofile=/tmp/hub-cover.out ./p2p/hub/...
-          total=$(go tool cover -func=/tmp/hub-cover.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v total="$total" 'BEGIN { if (total+0 < 85.0) { exit 1 } }'
+        run: bash scripts/ci/production-readiness.sh hub
 
   repo-validation:
     name: Repo Validation
@@ -55,11 +43,59 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Vet repository
-        run: go vet ./...
+      - name: Run repository validation
+        run: bash scripts/ci/production-readiness.sh repo
 
-      - name: Run repository Go tests
-        run: go test -count=1 ./...
+  deadcode-validation:
+    name: Dead Code Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run static analysis
+        run: bash scripts/ci/production-readiness.sh deadcode
+
+  security-validation:
+    name: Security Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run vulnerability scan
+        run: bash scripts/ci/production-readiness.sh security
+
+  race-validation:
+    name: Race Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run race tests
+        run: bash scripts/ci/production-readiness.sh race
 
   benchmark-smoke:
     name: Benchmark Smoke
@@ -76,7 +112,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run smoke benchmark
-        run: ./mixnet/benchmarks/run_local_benchmarks.sh smoke --runs 1
+        run: bash scripts/ci/production-readiness.sh bench
 
   docker-sanity:
     name: Docker Integration
@@ -93,4 +129,4 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run docker integration tests
-        run: go test -count=1 -tags docker_integration ./mixnet/core -run '^(TestDockerComposeUpDown|TestDockerFailureAndRecoverFromFailure)$' -v
+        run: bash scripts/ci/production-readiness.sh docker
