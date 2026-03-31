@@ -166,6 +166,7 @@ func TestDirectDialWorks(t *testing.T) {
 
 	// wait for dcutr to be available
 	waitForHolePunchingSvcActive(t, h2)
+	waitForRelayAddr(t, h2)
 
 	h1.Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.ConnectedAddrTTL)
 	// try to hole punch without any connection and streams, if it works -> it's a direct connection
@@ -272,6 +273,7 @@ func TestEndToEndSimConnect(t *testing.T) {
 			// Wait for holepunch service to start
 			waitForHolePunchingSvcActive(t, h1)
 			waitForHolePunchingSvcActive(t, h2)
+			waitForRelayAddr(t, h2)
 
 			learnAddrs(h1, h2)
 			pingAtoB(t, h1, h2)
@@ -661,6 +663,18 @@ func waitForHolePunchingSvcActive(t *testing.T, h host.Host) {
 	}, time.Second, 100*time.Millisecond)
 }
 
+func waitForRelayAddr(t *testing.T, h host.Host) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		for _, addr := range h.Addrs() {
+			if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond)
+}
+
 // TestEndToEndSimConnectQUICReuse tests that hole punching works if we are
 // reusing the same port for QUIC and WebTransport, and when we have multiple
 // QUIC listeners on different ports.
@@ -748,6 +762,7 @@ func TestEndToEndSimConnectQUICReuse(t *testing.T) {
 	// Wait for holepunch service to start
 	waitForHolePunchingSvcActive(t, h1)
 	waitForHolePunchingSvcActive(t, h2)
+	waitForRelayAddr(t, h2)
 
 	learnAddrs(h1, h2)
 	pingAtoB(t, h1, h2)
