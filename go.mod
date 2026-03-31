@@ -7,6 +7,7 @@ retract v0.26.1 // Tag was applied incorrectly due to a bug in the release workf
 retract v0.36.0 // Accidentally modified the tag.
 
 require (
+	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b
 	github.com/benbjohnson/clock v1.3.5
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
@@ -64,10 +65,12 @@ require (
 	golang.org/x/sys v0.41.0
 	golang.org/x/time v0.12.0
 	golang.org/x/tools v0.41.0
+	gonum.org/v1/gonum v0.15.1
 	google.golang.org/protobuf v1.36.6
 )
 
 require (
+	filippo.io/bigmod v0.1.1-0.20260103110540-f8a47775ebe5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -104,7 +107,6 @@ require (
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260109210033-bd525da824e2 // indirect
 	golang.org/x/text v0.34.0 // indirect
-	gonum.org/v1/gonum v0.15.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
