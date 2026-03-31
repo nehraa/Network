@@ -20,7 +20,6 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/conngater"
 	manet "github.com/multiformats/go-multiaddr/net"
 
-	"github.com/libp2p/go-libp2p-testing/ci"
 	tetc "github.com/libp2p/go-libp2p-testing/etc"
 	"github.com/libp2p/go-libp2p-testing/race"
 	ma "github.com/multiformats/go-multiaddr"
@@ -433,41 +432,38 @@ func TestAdding(t *testing.T) {
 }
 
 func TestRateLimiting(t *testing.T) {
-	if ci.IsRunning() {
-		t.Skip("buggy in CI")
-	}
-
 	rl := NewRateLimiter(10)
+	const tolerance = 25 * time.Millisecond
 
-	if !within(rl.Limit(10), time.Duration(float32(time.Second)), time.Millisecond) {
+	if !within(rl.Limit(10), time.Duration(float32(time.Second)), tolerance) {
 		t.Fatal()
 	}
-	if !within(rl.Limit(10), time.Duration(float32(time.Second*2)), time.Millisecond) {
+	if !within(rl.Limit(10), time.Duration(float32(time.Second*2)), tolerance) {
 		t.Fatal()
 	}
-	if !within(rl.Limit(10), time.Duration(float32(time.Second*3)), time.Millisecond) {
+	if !within(rl.Limit(10), time.Duration(float32(time.Second*3)), tolerance) {
 		t.Fatal()
 	}
 
-	if within(rl.Limit(10), time.Duration(float32(time.Second*3)), time.Millisecond) {
+	if !within(rl.Limit(10), time.Duration(float32(time.Second*4)), tolerance) {
 		t.Fatal()
 	}
 
 	rl.UpdateBandwidth(50)
-	if !within(rl.Limit(75), time.Duration(float32(time.Second)*1.5), time.Millisecond) {
+	if !within(rl.Limit(75), time.Duration(float32(time.Second)*1.5), tolerance) {
 		t.Fatal()
 	}
 
-	if within(rl.Limit(75), time.Duration(float32(time.Second)*1.5), time.Millisecond) {
+	if !within(rl.Limit(75), time.Duration(float32(time.Second)*3), tolerance) {
 		t.Fatal()
 	}
 
 	rl.UpdateBandwidth(100)
-	if !within(rl.Limit(1), time.Millisecond*10, time.Millisecond) {
+	if !within(rl.Limit(1), time.Millisecond*10, tolerance) {
 		t.Fatal()
 	}
 
-	if within(rl.Limit(1), time.Millisecond*10, time.Millisecond) {
+	if !within(rl.Limit(1), time.Millisecond*20, tolerance) {
 		t.Fatal()
 	}
 }

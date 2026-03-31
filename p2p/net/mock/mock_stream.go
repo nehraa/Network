@@ -24,7 +24,7 @@ type stream struct {
 	read      *io.PipeReader
 	toDeliver chan *transportObject
 
-	reset  chan struct{}
+	reset  chan error
 	close  chan struct{}
 	closed chan struct{}
 
@@ -57,7 +57,7 @@ func newStream(w *io.PipeWriter, r *io.PipeReader, dir network.Direction) *strea
 		read:      r,
 		write:     w,
 		id:        streamCounter.Add(1),
-		reset:     make(chan struct{}, 1),
+		reset:     make(chan error, 1),
 		close:     make(chan struct{}, 1),
 		closed:    make(chan struct{}),
 		toDeliver: make(chan *transportObject),
@@ -129,30 +129,21 @@ func (s *stream) Close() error {
 }
 
 func (s *stream) Reset() error {
-	// Cancel any pending reads/writes with an error.
-	s.write.CloseWithError(network.ErrReset)
-	s.read.CloseWithError(network.ErrReset)
-
-	select {
-	case s.reset <- struct{}{}:
-	default:
-	}
-	<-s.closed
-
-	// No meaningful error case here.
-	return nil
+	return s.ResetWithError(network.StreamNoError)
 }
 
-// ResetWithError resets the stream. It ignores the provided error code.
-// TODO: Implement error code support.
-func (s *stream) ResetWithError(_ network.StreamErrorCode) error {
-	// Cancel any pending reads/writes with an error.
+// ResetWithError resets the stream and propagates the provided error code to the
+// remote side through the paired pipe closures.
+func (s *stream) ResetWithError(errCode network.StreamErrorCode) error {
+	localErr := streamResetError(errCode, false)
+	remoteErr := streamResetError(errCode, true)
 
-	s.write.CloseWithError(network.ErrReset)
-	s.read.CloseWithError(network.ErrReset)
+	// Cancel any pending reads/writes with an error.
+	s.write.CloseWithError(remoteErr)
+	s.read.CloseWithError(remoteErr)
 
 	select {
-	case s.reset <- struct{}{}:
+	case s.reset <- localErr:
 	default:
 	}
 	<-s.closed
@@ -242,12 +233,12 @@ func (s *stream) transport() {
 		if buffered >= bufsize {
 			select {
 			case <-timer.C:
-			case <-s.reset:
+			case err := <-s.reset:
 				select {
-				case s.reset <- struct{}{}:
+				case s.reset <- err:
 				default:
 				}
-				return network.ErrReset
+				return err
 			}
 			if err := drainBuf(); err != nil {
 				return err
@@ -266,15 +257,15 @@ func (s *stream) transport() {
 	for {
 		// Reset takes precedent.
 		select {
-		case <-s.reset:
-			s.writeErr = network.ErrReset
+		case err := <-s.reset:
+			s.writeErr = err
 			return
 		default:
 		}
 
 		select {
-		case <-s.reset:
-			s.writeErr = network.ErrReset
+		case err := <-s.reset:
+			s.writeErr = err
 			return
 		case <-s.close:
 			if err := drainBuf(); err != nil {
@@ -307,4 +298,8 @@ func (s *stream) Scope() network.StreamScope {
 func (s *stream) cancelWrite(err error) {
 	s.write.CloseWithError(err)
 	s.writeErr = err
+}
+
+func streamResetError(code network.StreamErrorCode, remote bool) error {
+	return &network.StreamError{ErrorCode: code, Remote: remote}
 }
